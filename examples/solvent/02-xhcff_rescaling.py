@@ -22,18 +22,15 @@ import numpy as np
 from pyscf import gto
 from pyscf.solvent.xhcff import xhcff_external_terms
 
-# Anti conformer of 1-bromo-2-chloroethane (Angstrom).
-# C1-C2 bond along the x-axis; Br-C1-C2-Cl dihedral = 180 deg (anti).
-# Heavy atoms lie in the XY plane; H atoms are symmetric above/below.
 ATOM = '''
-Br  -0.657  -1.857   0.000
-C    0.000   0.000   0.000
-H   -0.363   0.514   0.890
-H   -0.363   0.514  -0.890
-C    1.520   0.000   0.000
-H    1.883  -0.514   0.890
-H    1.883  -0.514  -0.890
-Cl   2.120   1.697   0.000
+C          0.02681        0.49079       -2.62962
+C         -0.05658        0.73890       -1.13007
+H         -0.24045       -0.56340       -2.85431
+H          1.05878        0.68829       -2.98916
+Cl        -1.09975        1.56714       -3.49300
+Br         1.16840       -0.43138       -0.19047
+H         -1.08817        0.54091       -0.76933
+H          0.21129        1.79282       -0.90420
 '''
 
 mol = gto.M(atom=ATOM, basis='sto-3g', unit='Angstrom', verbose=0)
