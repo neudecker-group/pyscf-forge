@@ -70,7 +70,7 @@ def xhcff_external_terms(mol, pressure_mpa=50_000.0, npoints=302, scaling_factor
         g_ext[ia] = p_eff * (-sum_i + sum_all / natm)
 
     # Analytic external Hessian contribution from dA/dR
-    _, dA = get_dF_dA(surf, surface_discretization_method='SWIG')
+    _, dA = get_dF_dA(surf)
     h_ext = np.zeros((natm, natm, 3, 3))
     for ia in range(natm):
         mask_i = atom_idx == ia

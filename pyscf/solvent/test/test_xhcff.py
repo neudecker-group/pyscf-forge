@@ -3,42 +3,46 @@
 import types
 import numpy as np
 import pytest
-from scipy.optimize import brentq
 from pyscf import gto, scf
 from pyscf.tools import finite_diff
 from pyscf.solvent.xhcff import xhcff_external_terms
 
 
-def _hf_total_grad_fz(r_ang, pressure_mpa=0.0, npoints=110, scaling=1.2):
+def test_co2_dimer_xhcff_gradient_vs_qchem():
+    """XHCFF external gradient on CO2 dimer matches Q-Chem 6.0 reference.
+
+    Q-Chem settings: PBE/cc-pVDZ, pressure=100000 MPa, scaling=1.0,
+    npoints_heavy=302, npoints_hydrogen=302.
+    """
     mol = gto.M(
-        atom=f'H 0 0 0; F 0 0 {r_ang}',
-        basis='sto-3g',
+        atom='''O  2.6192991230  -0.0571311942  0.0;
+                C  1.6782610262   0.6502025480  0.0;
+                O  0.7413912820   1.3674070371  0.0;
+                C -1.6782610262  -0.6502025480  0.0;
+                O -2.6192991230   0.0571311942  0.0;
+                O -0.7413912820  -1.3674070371  0.0''',
+        basis='cc-pVDZ',
         unit='Angstrom',
         verbose=0,
     )
-    mf = scf.RHF(mol).run(conv_tol=1e-10)
-    grad = mf.Gradients().kernel()
-    if pressure_mpa > 0:
-        g_ext, _ = xhcff_external_terms(
-            mol,
-            pressure_mpa=pressure_mpa,
-            npoints=npoints,
-            scaling_factor=scaling,
-            rescale_forces=True,
-        )
-        grad = grad + g_ext
-    return grad[1, 2]
-
-
-def _optimize_hf_bond(pressure_mpa=0.0):
-    return brentq(lambda r: _hf_total_grad_fz(r, pressure_mpa=pressure_mpa), 0.8, 1.1)
-
-
-def test_hf_is_compressed_vs_vacuum():
-    r_vac = _optimize_hf_bond(pressure_mpa=0.0)
-    r_press = _optimize_hf_bond(pressure_mpa=50_000.0)
-    assert r_press < r_vac
-    assert (r_vac - r_press) < 0.05
+    g_ext, _ = xhcff_external_terms(
+        mol,
+        pressure_mpa=100_000.0,
+        npoints=302,
+        scaling_factor=1.0,
+        rescale_forces=True,
+    )
+    # Reference: "Gradient from external distort forces" block in Q-Chem output.
+    # Rows = xyz, columns = atoms; transposed to (natm, 3) convention.
+    ref = np.array([
+        [ 0.0666224, -0.0500447,  0.0],
+        [ 0.0027262,  0.0021840,  0.0],
+        [-0.0625846,  0.0535797,  0.0],
+        [-0.0027262, -0.0021840,  0.0],
+        [-0.0666224,  0.0500447,  0.0],
+        [ 0.0625846, -0.0535797,  0.0],
+    ])
+    np.testing.assert_allclose(g_ext, ref, rtol=0, atol=1e-7)
 
 
 def test_scf_convenience_methods_shape_and_pyscf_symmetry():
