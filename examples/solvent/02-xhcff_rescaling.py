@@ -68,8 +68,8 @@ try:
 
     x = np.arange(len(SCALE_FACTORS))
     fig, ax = plt.subplots(figsize=(6, 4))
-    ax.bar(x, norms_raw,      0.6,  label='Without rescaling', color='skyblue',    edgecolor='steelblue',  linewidth=0.8)
-    ax.bar(x, norms_rescaled, 0.35, label='With rescaling',    color='lightcoral', edgecolor='indianred',  linewidth=0.8)
+    ax.bar(x, norms_raw,      0.6,  label='Without rescaling', color='skyblue',    edgecolor='black', linewidth=0.8)
+    ax.bar(x, norms_rescaled, 0.35, label='With rescaling',    color='lightcoral', edgecolor='black', linewidth=0.8)
     ax.set_xlabel('Scaling Factor')
     ax.set_ylabel('Norm of X-HCFF gradients / a.u.')
     ax.set_xticks(x)
