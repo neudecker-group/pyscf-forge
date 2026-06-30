@@ -294,6 +294,7 @@ class GOSTSHYP(lib.StreamObject):
         import time as _time
         _t0 = _time.perf_counter()
 
+        print("Starting SCF cycle")
         if not (isinstance(dm, np.ndarray) and dm.ndim == 2):
             dm = dm[0] + dm[1]
 
@@ -462,6 +463,8 @@ class GOSTSHYP(lib.StreamObject):
         import time as _time
         _t0 = _time.perf_counter()
 
+        print("Calculating gradient")
+        self.opt_counter += 1
         if self.forces is None:
             raise RuntimeError(
                 'kernel() must be called before grad(). '
