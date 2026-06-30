@@ -13,22 +13,16 @@
 # limitations under the License.
 
 """
-GOSTSHYP pressure solvation model.
+GOSTSASH pressure solvation model.
 
-The GOSTSHYP (Gaussian On Surface Tesserae Simulate HYdrostatic Pressure)
-model applies an isotropic pressure to a molecular cavity surface using
+The GOSTSASH (Gaussian On Surface Tesserae Simulate Anisotropic Strain using Half-shells)
+model applies an anisotropic strain to a molecular cavity surface sliced into half-shells using
 Gaussian-weighted integrals.
 
 Supports two cavity types:
   - 'vdw': van der Waals surface with scaled Bondi radii
   - 'vdw/occ': Occluded van der Waals surface (crevice-free)
 
-References:
-    J. Chem. Theory Comput. 2021, 17, 1, 583-597
-    https://doi.org/10.1021/acs.jctc.0c01212
-
-    J. Chem. Theory Comput. 2025, 21, 2, 764-776
-    https://doi.org/10.1021/acs.jctc.4c01502
 """
 
 import numpy as np
@@ -40,10 +34,10 @@ from pyscf.solvent import _attach_solvent
 from pyscf.solvent.pcm import gen_surface, modified_Bondi
 from pyscf.solvent.grad.pcm import get_dF_dA
 import os
+from scipy.optimize import fsolve
 
 # Pressure conversion: 1 MPa = 3.3989309735473356e-08 Hartree/Bohr^3
 MPA_TO_AU = 3.3989309735473356e-08
-
 
 def fakemol_for_gaussian(coords, exponents, l=0, cart=True, coeffs=None):
     """Build a fake Mole object representing auxiliary Gaussians.
@@ -126,9 +120,44 @@ def compute_surface_normals(atom_coords, grid, atom_idx):
     return dr / dr_norm
 
 
-class GOSTSHYP(lib.StreamObject):
+def create_plane(p1, p2, p3):
     """
-    GOSTSHYP pressure solvation model.
+    Creates a plane from 3 points in space.
+    p3
+    ^ 
+    |(v2)
+    p1 -(v1)-> p2
+    Calculates normal vector and distance d of those 3 points.
+
+    Parameters
+    ----------
+    p1, p2, p3 : np.array
+    """
+    
+    # the two connecting vectors form the plane
+    v1 = p2 - p1
+    v2 = p3 - p1 
+
+    # cross product of v1 and v2 is orthogonal to them and the normal vector of the plane
+    normal = np.cross(v1, v2)
+    #print(f"normal = {normal}")
+
+    # Normalisation of the normal vector for exact euclidean distances
+    normal_length = np.linalg.norm(normal)
+    if np.abs(normal_length) < 1e-5:
+        raise ValueError("The three atoms lay on a straight line, therefore they cannot form a plane!")
+    # normal_normalised directs from the origin in direction of the plane
+    normal_normalised = normal / normal_length
+ 
+    # insert point 1 into plane equation: d = n_0 · p1
+    # d is distance of plane to origin
+    d = np.dot(normal_normalised, p1)
+
+    return normal_normalised, d
+
+class GOSTSASH(lib.StreamObject):
+    """
+    GOSTSASH pressure solvation model.
 
     Attributes
     ----------
@@ -164,6 +193,16 @@ class GOSTSHYP(lib.StreamObject):
         self.direct = options.get('direct', True)
         self.write_grid = options.get('write_grid', False)
         self.output = options.get('output', " ")
+        self.atom_list = options.get('atom_list', None)
+        if self.atom_list is not None:
+            self.atom1 = self.atom_list[0]
+            print(self.atom1)
+            self.atom2 = self.atom_list[1]
+            print(self.atom2)
+            self.atom3 = self.atom_list[2]
+            print(self.atom3)
+        self.plane_width = options.get('plane_width', 1.0) # Bohr (0.53 Ang)
+
         self.opt_counter = 0
         self.scf_counter = 0
 
@@ -215,6 +254,8 @@ class GOSTSHYP(lib.StreamObject):
             self.surface_dict = gen_surface(mol, ng=self.npoints, rad=rad)
             self._outer_surface_dict = None
             self._occ_ratio_sq = None
+        
+        self.slice_tessellation_field()
 
         # Build atom index
         atom_idx = np.zeros(len(self.surface_dict['area']), dtype=np.int32)
@@ -240,9 +281,132 @@ class GOSTSHYP(lib.StreamObject):
         self.__dict__.pop('gtilde', None)
         self.__dict__.pop('force_operators', None)
 
-        logger.info(self, 'GOSTSHYP: %d surface Gaussians (cavity=%s)',
+        logger.info(self, 'GOSTSASH: %d surface Gaussians (cavity=%s)',
                     self.n_gaussian, self.cavity)
         return self
+    
+    def slice_tessellation_field(self):
+        a1 = np.array(self.mol.atom_coord(self.atom1, unit = 'Bohr'))
+        a2 = np.array(self.mol.atom_coord(self.atom2, unit = 'Bohr'))
+        a3 = np.array(self.mol.atom_coord(self.atom3, unit = 'Bohr'))
+        normal_normalised, d = create_plane(a1, a2, a3)
+
+        # calculate distances of the grid coordinates to the plane
+        distances = np.dot(self.surface_dict['grid_coords'], normal_normalised) - d
+        #print(f"distances = {distances}")
+
+        # masking and filtering of the grid coordinates using plane width as a margin:
+
+        #print(f"plane_width = {plane_width}")
+        half_width = self.plane_width / 2.
+        #print(f"width_width = {width}")
+
+        slice_mask = np.abs(distances) <= half_width
+        print(np.count_nonzero(slice_mask))
+        print(len(distances))
+        print(f"Screened tess. points: {(np.count_nonzero(slice_mask) / len(distances)) * 100} %")
+        if (np.count_nonzero(slice_mask) / len(distances)) > 0.9:
+            raise ValueError(f"With the half_width = {half_width} Bohr you have screened away 90% of your tessellation points. \n It is not possible to create reasonable half-shells!")
+        
+        #  slice mask is a list of booleans
+        
+        anti_slice_mask = np.abs(distances) > half_width
+        #print(slice_mask)
+        print(f"half_width = {half_width}")
+
+
+        def match_average_objective(f):
+            """Solves numerically for exponent f, so that the mean of the final array list equals a predefined value"""
+            return np.mean((np.abs(distances) / half_width) ** f) - 1.0
+        
+        f_optimised = fsolve(match_average_objective, x0 = 50.0, full_output= 1)[0]
+        print(f"f_optimised = {f_optimised}")
+        print(f"type(f_optimised) = {type(f_optimised)}")
+        
+        self.pressure_au_list = self.pressure_au * (np.abs(distances) / half_width) ** f_optimised
+        P_inp_gostshyp_list = np.full_like(self.pressure_au_list, self.pressure_au)
+
+        P_inp_gostshyp_slice_mask = np.sum(P_inp_gostshyp_list[slice_mask])
+        print(f"P_inp_gostshyp_slice_mask = {P_inp_gostshyp_slice_mask} a. u.")
+        P_eff_gostsash_slice_mask = np.sum(self.pressure_au_list[slice_mask])
+        print(f"P_eff_gostsash_slice_mask = {P_eff_gostsash_slice_mask} a. u.")
+        P_inp_gostshyp_anti_slice_mask = np.sum(P_inp_gostshyp_list[anti_slice_mask])
+        print(f"P_inp_gostshyp_anti_slice_mask = {P_inp_gostshyp_anti_slice_mask} a. u.")
+        P_eff_gostsash_anti_slice_mask = np.sum(self.pressure_au_list[anti_slice_mask])
+        print(f"P_eff_gostsash_anti_slice_mask = {P_eff_gostsash_anti_slice_mask} a. u.")
+
+        print(f"GOSTSHYP total sum: {np.sum(P_inp_gostshyp_list)} a. u.")
+        print(f"GOSTSASH total sum: {np.sum(self.pressure_au_list)} a. u.")
+        
+        #print(anti_slice_mask)
+        #print(np.abs(distances[0]))
+        #print(half_width)
+        #print(f"self.slice_mask[0] = np.abs(distances[0]) <= half_width = {np.abs(distances[0]) <= half_width}")
+        #print(f"slice_mask = {slice_mask}")
+
+        #self.pressure_au_list = np.full(len(self.surface_dict['grid_coords']), self.pressure_au)
+        #print(self.pressure_au_list)
+        #print(len(self.pressure_au_list))
+        #pressure_scaling = np.ones_like(self.pressure_au_list)
+        #pressure_scaling[slice_mask] = np.abs(distances[slice_mask] / np.max(distances[slice_mask]))
+        
+        #self.pressure_au_list *= pressure_scaling
+        print(np.min(self.pressure_au_list))
+        print(np.max(self.pressure_au_list))
+        print(f"self.pressure_au_list = {self.pressure_au_list}")
+        print(f"P_inp = {self.pressure_au} a.u.")
+        print(f"P_eff = {np.mean(self.pressure_au_list)} a.u.")
+        
+        #P_diff = np.full(len(self.surface_dict['grid_coords']), self.pressure_au) - self.pressure_au_list
+        
+        #print(f"sum(P_diff) = {np.sum(P_diff)}")
+        #print(f"len(grid_coords[anti_slice_mask]) = {len(self.surface_dict["grid_coords"][anti_slice_mask])}")
+        #pressure_scaling[anti_slice_mask] = (np.abs(distances[anti_slice_mask] / half_width))
+        #self.pressure_au_list *= pressure_scaling
+        #print(f"Updated P_eff = {np.mean(self.pressure_au_list)} a.u.")
+        #print(np.min(self.pressure_au_list))
+        #print(np.max(self.pressure_au_list))
+
+
+        #print(f"slice_mask = {slice_mask}")
+        #print(f"len(slice_mask) = {len(slice_mask)}")
+        
+        #filtered_coords = self.surface_dict["grid_coords"][slice_mask]
+        #print(filtered_coords)
+        #print(len(filtered_coords))
+        #filtered_areas = self.surface_dict["area"][slice_mask]
+        #filtered_switch_fun = self.surface_dict["switch_fun"][slice_mask]
+
+        #discarded = len(self.surface_dict["grid_coords"]) - len(filtered_coords)
+        #logger.info(self, f"Number of discarded grid points: {discarded}")
+
+        #self.surface_dict["grid_coords"] = filtered_coords
+        #self.surface_dict["area"] = filtered_areas
+        #self.surface_dict["switch_fun"] = filtered_switch_fun
+
+        #for i in range(len(self.surface_dict["gslice_by_atom"])):
+            #print(slice_mask[self.surface_dict["gslice_by_atom"][i][0]:self.surface_dict["gslice_by_atom"][i][1]])
+            #print(len(slice_mask[self.surface_dict["gslice_by_atom"][i][0]:self.surface_dict["gslice_by_atom"][i][1]]))
+
+            #counter = (len(slice_mask[self.surface_dict["gslice_by_atom"][i][0]:self.surface_dict["gslice_by_atom"][i][1]])
+                   #- np.sum(slice_mask[self.surface_dict["gslice_by_atom"][i][0]:self.surface_dict["gslice_by_atom"][i][1]]))
+
+            #print(f"counter = {counter}")
+            #self.surface_dict["gslice_by_atom"][i][1] -= np.int64(counter)
+            #if i < len(self.surface_dict["gslice_by_atom"]) - 1:
+                #self.surface_dict["gslice_by_atom"][i+1][0] = self.surface_dict["gslice_by_atom"][i][1]
+
+        #print(f"Updated: gslice_by_atom = {self.surface_dict["gslice_by_atom"]}")
+        
+        #if self.cavity == 'vdw/occ':
+            #self._outer_surface_dict["switch_fun"] = self.surface_dict["switch_fun"]
+            #self._outer_surface_dict["gslice_by_atom"] = self.surface_dict["gslice_by_atom"]
+            #filtered_outer_coords = self._outer_surface_dict["grid_coords"][slice_mask]
+            #self._outer_surface_dict["grid_coords"] = filtered_outer_coords
+            #filtered_outer_area = self._outer_surface_dict["area"][slice_mask]
+            #self._outer_surface_dict["area"] = filtered_outer_area
+            #filtered_occ_ratio_sq = self._occ_ratio_sq[slice_mask]
+            #self._occ_ratio_sq = filtered_occ_ratio_sq
 
     def dump_flags(self, verbose=None):
         logger.info(self, '******** %s ********', self.__class__)
@@ -255,25 +419,39 @@ class GOSTSHYP(lib.StreamObject):
             logger.info(self, 'r_ext = %.4f Bohr', self.r_ext)
         logger.info(self, 'direct = %s', self.direct)
         logger.info(self, 'n_gaussian = %d', self.n_gaussian)
+        logger.info(self, f'atom_list = {self.atom_list}')
+        logger.info(self, 'atom1 = %i', self.atom1)
+        logger.info(self, 'atom2 = %i', self.atom2)
+        logger.info(self, 'atom3 = %i', self.atom3)
+        logger.info(self, 'plane_width = %.4f Bohr', self.plane_width)
         return self
 
     def check_sanity(self):
-        if self.pressure_mpa <= 0:
+        if self.pressure_mpa < 0.:
             raise ValueError(f'pressure_mpa must be positive, got {self.pressure_mpa}')
-        if self.scaling_factor <= 0:
+        if self.scaling_factor < 0.:
             raise ValueError(f'scaling_factor must be positive, got {self.scaling_factor}')
         if self.cavity not in ('vdw', 'vdw/occ'):
             raise ValueError(f"cavity must be 'vdw' or 'vdw/occ', got '{self.cavity}'")
-        if self.cavity == 'vdw/occ' and self.r_ext <= 0:
+        if self.cavity == 'vdw/occ' and self.r_ext < 0.0:
             raise ValueError(f'r_ext must be positive for vdw/occ cavity, got {self.r_ext}')
         if self.write_grid == True and self.output == " ":
             raise ValueError(f'If grid and amplitudes should be written to file, you have to give a file path for the output')
         if self.write_grid == True and not os.path.isdir(self.output):
-            raise ValueError(f"The output file path {self.output} you have given does not exist!")
+            raise ValueError(f"The output file path '{self.output}' you have given does not exist!")
+        if not isinstance(self.atom_list, list):
+            raise ValueError(f"atom_list must be a list of 3 atom indices, got '{self.atom_list}'")
+        if len(self.atom_list) != 3:
+            raise ValueError(f"atom_list must be a list of exactly 3 atom indices, got '{self.atom_list}'")
+        if not isinstance(self.atom1, int) or not isinstance(self.atom2, int) or not isinstance(self.atom3, int):
+            raise ValueError(f"atom_list must be a list of exactly 3 atom indices of type int, got '[{self.atom1}, {self.atom2}, {self.atom3}]'")
+        if self.plane_width <= 0.0:
+            raise ValueError(f'plane_width must be positive, got {self.plane_width}')
+
         return self
 
     def kernel(self, dm):
-        """Compute GOSTSHYP energy and Fock matrix contribution.
+        """Compute GOSTSASH energy and Fock matrix contribution.
 
         Parameters
         ----------
@@ -299,14 +477,23 @@ class GOSTSHYP(lib.StreamObject):
         nao = self.mol.nao_nr()
         dm_flat = dm.ravel(order='F')
         forces = dm_flat @ self.force_operators.reshape(nao * nao, -1, order='F')
-        amplitudes = self.pressure_au * self.areas / forces
+        amplitudes = self.pressure_au_list * self.areas / forces
+        
         mask = amplitudes < 0
         if np.any(mask):
             n_neg = np.count_nonzero(mask)
-            logger.warn(self, 'GOSTSHYP: %d/%d (%.1f%%) negative amplitudes removed',
+            logger.warn(self, 'GOSTSASH: %d/%d (%.1f%%) negative amplitudes removed',
                         n_neg, amplitudes.size, 100.0 * n_neg / amplitudes.size)
             amplitudes[mask] = 0.0
             forces[mask] = 1.0  # avoid division by zero in gradient
+
+        #if np.any(self.slice_mask):
+        #    n_sliced = np.count_nonzero(self.slice_mask)
+        #    logger.info(self, 'GOSTSASH: %d/%d (%.1f%%) amplitudes have been set to 0 due to slicing',
+        #                n_sliced, amplitudes.size, 100.0 * n_sliced / amplitudes.size)
+        #    amplitudes[self.slice_mask] = 0.0
+        #    forces[self.slice_mask] = 1.0
+
         self.amplitudes = amplitudes
         
         if self.write_grid:
@@ -319,7 +506,7 @@ class GOSTSHYP(lib.StreamObject):
 
         fock1 = (self.gtilde.reshape(nao * nao, -1, order='F') @ amplitudes
                  ).reshape(nao, nao, order='F')
-        fock2 = -self.pressure_au * self.areas * gtilde_expval / (forces ** 2)
+        fock2 = -self.pressure_au_list * self.areas * gtilde_expval / (forces ** 2)
         fock2 = (self.force_operators.reshape(nao * nao, -1, order='F') @ fock2
                  ).reshape(nao, nao, order='F')
 
@@ -328,7 +515,7 @@ class GOSTSHYP(lib.StreamObject):
 
         self.e = energy
         self.v = fock
-        logger.info(self, 'GOSTSHYP energy: %.10f', energy)
+        logger.info(self, 'GOSTSASH energy: %.10f', energy)
         self.scf_counter += 1
         return energy, fock
 
@@ -375,14 +562,23 @@ class GOSTSHYP(lib.StreamObject):
                                   optimize=False)
             force_ops_2d = force_ops.reshape(nao2, -1, order='F')
             forces = dm_flat @ force_ops_2d
-            amplitudes = self.pressure_au * self.areas[shell_slice] / forces
+            amplitudes = self.pressure_au_list[shell_slice] * self.areas[shell_slice] / forces
+            
             mask = amplitudes < 0
             if np.any(mask):
                 n_neg = np.count_nonzero(mask)
-                logger.warn(self, 'GOSTSHYP: %d/%d (%.1f%%) negative amplitudes removed',
+                logger.warn(self, 'GOSTSASH: %d/%d (%.1f%%) negative amplitudes removed',
                             n_neg, amplitudes.size, 100.0 * n_neg / amplitudes.size)
                 amplitudes[mask] = 0.0
                 forces[mask] = 1.0  # avoid division by zero in gradient
+
+            #if np.any(self.slice_mask[shell_slice]):
+            #    n_sliced = np.count_nonzero(self.slice_mask[shell_slice])
+            #    logger.info(self, 'GOSTSASH: %d/%d (%.1f%%) amplitudes have been set to 0 due to slicing',
+            #            n_sliced, amplitudes.size, 100.0 * n_sliced / amplitudes.size)
+            #    amplitudes[self.slice_mask[shell_slice]] = 0.0
+            #    forces[self.slice_mask[shell_slice]] = 1.0
+
             self.amplitudes[shell_slice] = amplitudes
             self.forces[shell_slice] = forces
 
@@ -391,7 +587,7 @@ class GOSTSHYP(lib.StreamObject):
 
             gtilde_expval = dm_flat @ overlap3_s_2d
             self.gtilde_expval[shell_slice] = gtilde_expval
-            f2 = -self.pressure_au * self.areas[shell_slice] * gtilde_expval / (forces ** 2)
+            f2 = -self.pressure_au_list[shell_slice] * self.areas[shell_slice] * gtilde_expval / (forces ** 2)
             f2 = (force_ops_2d @ f2).reshape(nao, nao, order='F')
 
             fock += f1 + f2
@@ -402,7 +598,7 @@ class GOSTSHYP(lib.StreamObject):
 
         self.e = energy
         self.v = fock
-        logger.info(self, 'GOSTSHYP energy: %.10f', energy)
+        logger.info(self, 'GOSTSASH energy: %.10f', energy)
         self.scf_counter += 1
         return energy, fock
 
@@ -433,7 +629,7 @@ class GOSTSHYP(lib.StreamObject):
         return force_ops
 
     def grad(self, dm):
-        """Compute analytical nuclear gradient of GOSTSHYP energy.
+        """Compute analytical nuclear gradient of GOSTSASH energy.
 
         Parameters
         ----------
@@ -474,8 +670,8 @@ class GOSTSHYP(lib.StreamObject):
         gtilde_expval = self.gtilde_expval
 
         # Term 1: area derivative
-        dE1 = self.pressure_au * np.einsum(
-            'acg,g->ac', dareas, gtilde_expval / forces, optimize=True)
+        dE1 = np.einsum(
+            'g,acg,g->ac', self.pressure_au_list, dareas, gtilde_expval / forces, optimize=True)
 
         # Term 2: gtilde operator derivative
         gmol = fakemol_for_gaussian(self.grid_coords, self.widths)
@@ -527,7 +723,7 @@ class GOSTSHYP(lib.StreamObject):
 
         # Term 3: force operator derivative
         coeffs_fop = (
-            -2.0 * self.pressure_au * self.areas * gtilde_expval
+            -2.0 * self.pressure_au_list * self.areas * gtilde_expval
             * self.widths / (forces * forces))
         gmol_f = fakemol_for_gaussian(
             self.grid_coords, self.widths, l=1, coeffs=coeffs_fop)
@@ -586,8 +782,8 @@ class GOSTSHYP(lib.StreamObject):
         dFdR = dareas * wgrad_prefs * forces / self.widths
         dFdR += np.einsum('gc,axg->axg', dr, dareas, optimize=True)
         width_grad_ftype = (
-            -self.pressure_au * np.einsum(
-                'g,g,axg,g->ax', self.areas, gtilde_expval,
+            -np.einsum(
+                'g,g,g,axg,g->ax', self.pressure_au_list, self.areas, gtilde_expval,
                 dFdR, rf2, optimize=True))
 
         dE3 = force_operator_grad + width_grad_ftype
@@ -614,9 +810,21 @@ class GOSTSHYP(lib.StreamObject):
         amplitudes = self.amplitudes
         wgrad_prefs = -np.pi * np.log(2) / (self.areas ** 2)
 
+        #print(len(dareas))
+        #print(dareas.shape)
+        #print(len(gtilde_expval))
+        #print(gtilde_expval.shape)
+        #print(len(forces))
+        #print(forces.shape)
+        #print(len(self.pressure_au_list))
+        #print(self.pressure_au_list.shape)
         # Term 1: area derivative (no chunking needed)
-        dE1 = self.pressure_au * np.einsum(
-            'acg,g->ac', dareas, gtilde_expval / forces, optimize=True)
+        dE1 = np.einsum(
+            'acg,g,g->ac', dareas, self.pressure_au_list, gtilde_expval / forces, optimize=True)
+        
+        #tmp1 = np.einsum('acg,g,g->ac', dareas, self.pressure_au_list, gtilde_expval / forces, optimize=True)
+        #tmp2 = np.einsum('g,acg,g->ac', self.pressure_au_list, dareas, gtilde_expval / forces, optimize=True)
+        #np.testing.assert_array_almost_equal(tmp2, tmp1)
 
         # Chunk size: peak memory is 18 * nao^2 * C * 8 bytes
         max_memory = max(2000, mol.max_memory * 0.9 - lib.current_memory()[0])
@@ -643,6 +851,7 @@ class GOSTSHYP(lib.StreamObject):
             coords_c = self.grid_coords[chunk_idx]
             widths_c = self.widths[chunk_idx]
             areas_c = self.areas[chunk_idx]
+            pressure_au_list_c = self.pressure_au_list[chunk_idx]
             normals_c = self.surface_normals[chunk_idx]
             amplitudes_c = amplitudes[chunk_idx]
             forces_c = forces[chunk_idx]
@@ -706,7 +915,7 @@ class GOSTSHYP(lib.StreamObject):
 
             # --- Term 3: force operator derivative ---
             coeffs_fop_c = (
-                -2.0 * self.pressure_au * areas_c * gtilde_expval_c
+                -2.0 * pressure_au_list_c * areas_c * gtilde_expval_c
                 * widths_c / (forces_c * forces_c))
 
             # p-type ip1 bra/ket
@@ -776,8 +985,8 @@ class GOSTSHYP(lib.StreamObject):
             dr *= normals_c
             dFdR = dareas_c * wgrad_prefs_c * forces_c  / widths_c
             dFdR += np.einsum('gc,axg->axg', dr, dareas_c, optimize=True)
-            width_grad_ftype -= self.pressure_au * np.einsum(
-                'g,g,axg,g->ax', areas_c, gtilde_expval_c,
+            width_grad_ftype -= np.einsum(
+                'g,g,g,axg,g->ax', pressure_au_list_c, areas_c, gtilde_expval_c,
                 dFdR, rf2_c, optimize=True)
 
         dE2 = gtilde_operator_grad + dE_d_total
@@ -803,16 +1012,16 @@ class GOSTSHYP(lib.StreamObject):
 
 
 @lib.with_doc(_attach_solvent._for_scf.__doc__)
-def gostshyp_for_scf(mf, solvent_obj=None, dm=None):
-    """Attach GOSTSHYP solvent model to SCF method."""
+def gostsash_for_scf(mf, solvent_obj=None, dm=None):
+    """Attach GOSTSASH solvent model to SCF method."""
     if not isinstance(mf, scf.hf.SCF):
         raise TypeError(
-            'GOSTSHYP can only be used with SCF methods (RHF/UHF/RKS/UKS). '
+            'GOSTSASH can only be used with SCF methods (RHF/UHF/RKS/UKS). '
             f'Got {mf.__class__.__name__}')
     if solvent_obj is None:
-        solvent_obj = GOSTSHYP(mf.mol)
+        solvent_obj = GOSTSASH(mf.mol)
     return _attach_solvent._for_scf(mf, solvent_obj, dm)
 
 
-# Inject GOSTSHYP into SCF classes
-scf.hf.SCF.GOSTSHYP = gostshyp_for_scf
+# Inject GOSTSASH into SCF classes
+scf.hf.SCF.GOSTSASH = gostsash_for_scf
