@@ -35,6 +35,7 @@ from pyscf.solvent.pcm import gen_surface, modified_Bondi
 from pyscf.solvent.grad.pcm import get_dF_dA
 import os
 from scipy.optimize import fsolve
+import math
 
 # Pressure conversion: 1 MPa = 3.3989309735473356e-08 Hartree/Bohr^3
 MPA_TO_AU = 3.3989309735473356e-08
@@ -286,127 +287,48 @@ class GOSTSASH(lib.StreamObject):
         return self
     
     def slice_tessellation_field(self):
-        a1 = np.array(self.mol.atom_coord(self.atom1, unit = 'Bohr'))
-        a2 = np.array(self.mol.atom_coord(self.atom2, unit = 'Bohr'))
-        a3 = np.array(self.mol.atom_coord(self.atom3, unit = 'Bohr'))
+        if self.atom1 == self.atom2 or self.atom1 == self.atom3 or self.atom2 == self.atom3:
+            raise ValueError(f"The three atom indices should be different atoms, got: [{self.atom1}, {self.atom2}, {self.atom3}]!")
+        if 0 <= self.atom1 < self.mol.natm:
+            a1 = np.array(self.mol.atom_coord(self.atom1, unit = 'Bohr'))
+        else:
+            raise ValueError(f"The atom index {self.atom1} does not exist in this molecule!")
+        if 0 <= self.atom2 < self.mol.natm:
+            a2 = np.array(self.mol.atom_coord(self.atom2, unit = 'Bohr'))
+        else:
+            raise ValueError(f"The atom index {self.atom2} does not exist in this molecule!")
+        if 0 <= self.atom3 < self.mol.natm:
+            a3 = np.array(self.mol.atom_coord(self.atom3, unit = 'Bohr'))
+        else:
+            raise ValueError(f"The atom index {self.atom3} does not exist in this molecule!")
         normal_normalised, d = create_plane(a1, a2, a3)
 
         # calculate distances of the grid coordinates to the plane
         distances = np.dot(self.surface_dict['grid_coords'], normal_normalised) - d
-        #print(f"distances = {distances}")
 
-        # masking and filtering of the grid coordinates using plane width as a margin:
-
-        #print(f"plane_width = {plane_width}")
+        # masking and filtering of the grid coordinates using plane width as a margin to both sides:
         half_width = self.plane_width / 2.
-        #print(f"width_width = {width}")
-
+        logger.info(self, f"half_width = {half_width:.3f} Bohr")
         slice_mask = np.abs(distances) <= half_width
-        print(np.count_nonzero(slice_mask))
-        print(len(distances))
-        print(f"Screened tess. points: {(np.count_nonzero(slice_mask) / len(distances)) * 100} %")
-        if (np.count_nonzero(slice_mask) / len(distances)) > 0.9:
-            raise ValueError(f"With the half_width = {half_width} Bohr you have screened away 90% of your tessellation points. \n It is not possible to create reasonable half-shells!")
-        
-        #  slice mask is a list of booleans
-        
-        anti_slice_mask = np.abs(distances) > half_width
-        #print(slice_mask)
-        print(f"half_width = {half_width}")
-
+        logger.info(self, f"Tess. points in cylindrical part: {(np.count_nonzero(slice_mask) / len(distances)) * 100:.3f} percent.")
+        if np.count_nonzero(slice_mask) == len(distances):
+            raise ValueError(f"It is not possible to create reasonable half-shells! \nPlease try again using a smaller width than {self.plane_width} Bohr!")
 
         def match_average_objective(f):
             """Solves numerically for exponent f, so that the mean of the final array list equals a predefined value"""
             return np.mean((np.abs(distances) / half_width) ** f) - 1.0
         
-        f_optimised = fsolve(match_average_objective, x0 = 50.0, full_output= 1)[0]
-        print(f"f_optimised = {f_optimised}")
-        print(f"type(f_optimised) = {type(f_optimised)}")
+        f_optimised = fsolve(match_average_objective, x0 = 50.0, full_output = 1)[0]
+        logger.info(self, f"f_optimised = {f_optimised}")
         
         self.pressure_au_list = self.pressure_au * (np.abs(distances) / half_width) ** f_optimised
-        P_inp_gostshyp_list = np.full_like(self.pressure_au_list, self.pressure_au)
 
-        P_inp_gostshyp_slice_mask = np.sum(P_inp_gostshyp_list[slice_mask])
-        print(f"P_inp_gostshyp_slice_mask = {P_inp_gostshyp_slice_mask} a. u.")
-        P_eff_gostsash_slice_mask = np.sum(self.pressure_au_list[slice_mask])
-        print(f"P_eff_gostsash_slice_mask = {P_eff_gostsash_slice_mask} a. u.")
-        P_inp_gostshyp_anti_slice_mask = np.sum(P_inp_gostshyp_list[anti_slice_mask])
-        print(f"P_inp_gostshyp_anti_slice_mask = {P_inp_gostshyp_anti_slice_mask} a. u.")
-        P_eff_gostsash_anti_slice_mask = np.sum(self.pressure_au_list[anti_slice_mask])
-        print(f"P_eff_gostsash_anti_slice_mask = {P_eff_gostsash_anti_slice_mask} a. u.")
+        if not math.isclose(self.pressure_au, np.mean(self.pressure_au_list), abs_tol=0.00000000000001):
+            raise ValueError(f"The effective pressure of {self.pressure_au} a.u. can no longer be established, as the mean pressure is {np.mean(self.pressure_au_list)} a.u.! \nPlease try again using a smaller width than {self.plane_width} Bohr!")
 
-        print(f"GOSTSHYP total sum: {np.sum(P_inp_gostshyp_list)} a. u.")
-        print(f"GOSTSASH total sum: {np.sum(self.pressure_au_list)} a. u.")
+        logger.info(self, f"P_inp = {self.pressure_au:.14f} a.u.")
+        logger.info(self, f"P_eff = {np.mean(self.pressure_au_list):.14f} a.u.")
         
-        #print(anti_slice_mask)
-        #print(np.abs(distances[0]))
-        #print(half_width)
-        #print(f"self.slice_mask[0] = np.abs(distances[0]) <= half_width = {np.abs(distances[0]) <= half_width}")
-        #print(f"slice_mask = {slice_mask}")
-
-        #self.pressure_au_list = np.full(len(self.surface_dict['grid_coords']), self.pressure_au)
-        #print(self.pressure_au_list)
-        #print(len(self.pressure_au_list))
-        #pressure_scaling = np.ones_like(self.pressure_au_list)
-        #pressure_scaling[slice_mask] = np.abs(distances[slice_mask] / np.max(distances[slice_mask]))
-        
-        #self.pressure_au_list *= pressure_scaling
-        print(np.min(self.pressure_au_list))
-        print(np.max(self.pressure_au_list))
-        print(f"self.pressure_au_list = {self.pressure_au_list}")
-        print(f"P_inp = {self.pressure_au} a.u.")
-        print(f"P_eff = {np.mean(self.pressure_au_list)} a.u.")
-        
-        #P_diff = np.full(len(self.surface_dict['grid_coords']), self.pressure_au) - self.pressure_au_list
-        
-        #print(f"sum(P_diff) = {np.sum(P_diff)}")
-        #print(f"len(grid_coords[anti_slice_mask]) = {len(self.surface_dict["grid_coords"][anti_slice_mask])}")
-        #pressure_scaling[anti_slice_mask] = (np.abs(distances[anti_slice_mask] / half_width))
-        #self.pressure_au_list *= pressure_scaling
-        #print(f"Updated P_eff = {np.mean(self.pressure_au_list)} a.u.")
-        #print(np.min(self.pressure_au_list))
-        #print(np.max(self.pressure_au_list))
-
-
-        #print(f"slice_mask = {slice_mask}")
-        #print(f"len(slice_mask) = {len(slice_mask)}")
-        
-        #filtered_coords = self.surface_dict["grid_coords"][slice_mask]
-        #print(filtered_coords)
-        #print(len(filtered_coords))
-        #filtered_areas = self.surface_dict["area"][slice_mask]
-        #filtered_switch_fun = self.surface_dict["switch_fun"][slice_mask]
-
-        #discarded = len(self.surface_dict["grid_coords"]) - len(filtered_coords)
-        #logger.info(self, f"Number of discarded grid points: {discarded}")
-
-        #self.surface_dict["grid_coords"] = filtered_coords
-        #self.surface_dict["area"] = filtered_areas
-        #self.surface_dict["switch_fun"] = filtered_switch_fun
-
-        #for i in range(len(self.surface_dict["gslice_by_atom"])):
-            #print(slice_mask[self.surface_dict["gslice_by_atom"][i][0]:self.surface_dict["gslice_by_atom"][i][1]])
-            #print(len(slice_mask[self.surface_dict["gslice_by_atom"][i][0]:self.surface_dict["gslice_by_atom"][i][1]]))
-
-            #counter = (len(slice_mask[self.surface_dict["gslice_by_atom"][i][0]:self.surface_dict["gslice_by_atom"][i][1]])
-                   #- np.sum(slice_mask[self.surface_dict["gslice_by_atom"][i][0]:self.surface_dict["gslice_by_atom"][i][1]]))
-
-            #print(f"counter = {counter}")
-            #self.surface_dict["gslice_by_atom"][i][1] -= np.int64(counter)
-            #if i < len(self.surface_dict["gslice_by_atom"]) - 1:
-                #self.surface_dict["gslice_by_atom"][i+1][0] = self.surface_dict["gslice_by_atom"][i][1]
-
-        #print(f"Updated: gslice_by_atom = {self.surface_dict["gslice_by_atom"]}")
-        
-        #if self.cavity == 'vdw/occ':
-            #self._outer_surface_dict["switch_fun"] = self.surface_dict["switch_fun"]
-            #self._outer_surface_dict["gslice_by_atom"] = self.surface_dict["gslice_by_atom"]
-            #filtered_outer_coords = self._outer_surface_dict["grid_coords"][slice_mask]
-            #self._outer_surface_dict["grid_coords"] = filtered_outer_coords
-            #filtered_outer_area = self._outer_surface_dict["area"][slice_mask]
-            #self._outer_surface_dict["area"] = filtered_outer_area
-            #filtered_occ_ratio_sq = self._occ_ratio_sq[slice_mask]
-            #self._occ_ratio_sq = filtered_occ_ratio_sq
 
     def dump_flags(self, verbose=None):
         logger.info(self, '******** %s ********', self.__class__)

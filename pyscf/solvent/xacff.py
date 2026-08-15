@@ -16,7 +16,7 @@ from pyscf.hessian import rhf as rhf_hess
 from pyscf.solvent.pcm import gen_surface, modified_Bondi
 from pyscf.solvent.grad.pcm import get_dF_dA
 from scipy.optimize import fsolve
-import os
+import math
 
 # 1 MPa in Eh/Bohr^3
 MPA_TO_AU = 3.3989309735473356e-08
@@ -92,22 +92,28 @@ def xacff_external_terms(mol, pressure_mpa=50_000.0, npoints=302, scaling_factor
         raise ValueError(f"atom_list must be a list of 3 atom indices, got '{atom_list}'")
     if len(atom_list) != 3:
         raise ValueError(f"atom_list must be a list of exactly 3 atom indices, got '{atom_list}'")
-    
+    if not isinstance(atom_list[0], int) or not isinstance(atom_list[1], int) or not isinstance(atom_list[2], int):
+        raise ValueError(f"atom_list must be a list of exactly 3 atom indices of type int, got '[{atom_list[0]}, {atom_list[1]}, {atom_list[2]}]'")
+
     atom1 = atom_list[0]
     atom2 = atom_list[1]
     atom3 = atom_list[2]
 
-    a1 = np.array(mol.atom_coord(atom1, unit = 'Bohr'))
-    a2 = np.array(mol.atom_coord(atom2, unit = 'Bohr'))
-    a3 = np.array(mol.atom_coord(atom3, unit = 'Bohr'))
+    if atom1 == atom2 or atom1 == atom3 or atom2 == atom3:
+        raise ValueError(f"The three atom indices should be different atoms, got: [{atom1}, {atom2}, {atom3}]!")
+    if 0 <= atom1 < mol.natm:
+        a1 = np.array(mol.atom_coord(atom1, unit = 'Bohr'))
+    else:
+        raise ValueError(f"The atom index {atom1} does not exist in this molecule!")
+    if 0 <= atom2 < mol.natm:
+        a2 = np.array(mol.atom_coord(atom2, unit = 'Bohr'))
+    else:
+        raise ValueError(f"The atom index {atom2} does not exist in this molecule!")
+    if 0 <= atom3 < mol.natm:
+        a3 = np.array(mol.atom_coord(atom3, unit = 'Bohr'))
+    else:
+        raise ValueError(f"The atom index {atom3} does not exist in this molecule!")
     normal_normalised, d = create_plane(a1, a2, a3)
-
-    if not isinstance(atom1, int) or not isinstance(atom2, int) or not isinstance(atom3, int):
-        raise ValueError(f"atom_list must be a list of exactly 3 atom indices of type int, got '[{atom1}, {atom2}, {atom3}]'")
-    if plane_width is None:
-        raise ValueError(f"You have to specify the width of the family of planes (in Bohr) to construct the half-shells from!")
-    if plane_width <= 0.0:
-        raise ValueError(f'plane_width must be positive, got {plane_width} Bohr')
 
     natm = mol.natm
     coords = mol.atom_coords()
@@ -118,17 +124,19 @@ def xacff_external_terms(mol, pressure_mpa=50_000.0, npoints=302, scaling_factor
     nvec = surface_normals(coords, grid, atom_idx)
 
     distances = np.dot(grid, normal_normalised) - d
+
+    if plane_width is None:
+        raise ValueError(f"You have to specify the width of the family of planes (in Bohr) to construct the half-shells from!")
+    if plane_width <= 0.0:
+        raise ValueError(f'plane_width must be positive, got {plane_width} Bohr')
+        
     half_width = plane_width / 2.
 
     slice_mask = np.abs(distances) <= half_width
-    print(np.count_nonzero(slice_mask))
-    print(len(distances))
-    print(f"Screened tess. points: {(np.count_nonzero(slice_mask) / len(distances)) * 100} %")
-    if (np.count_nonzero(slice_mask) / len(distances)) > 0.9:
-        raise ValueError(f"With the half_width = {half_width} Bohr you have screened away 90% of your tessellation points. \n It is not possible to create reasonable half-shells!")
-
-    anti_slice_mask = np.abs(distances) > half_width
-    print(f"half_width = {half_width}")
+    print(f"Tess. points in cylindrical part: {(np.count_nonzero(slice_mask) / len(distances)) * 100:.3f} %")
+    if np.count_nonzero(slice_mask) == len(distances):
+        raise ValueError(f"It is not possible to create reasonable half-shells! \nPlease try again using a smaller width than {plane_width} Bohr!")
+    print(f"half_width = {half_width:.3f} Bohr")
 
 
     def match_average_objective(f):
@@ -143,25 +151,12 @@ def xacff_external_terms(mol, pressure_mpa=50_000.0, npoints=302, scaling_factor
     p_eff = p_au * scale
         
     p_eff_list = p_eff * (np.abs(distances) / half_width) ** f_optimised
-    P_inp_xhcff_list = np.full_like(p_eff_list, p_eff)
 
-    P_inp_xhcff_slice_mask = np.sum(P_inp_xhcff_list[slice_mask])
-    print(f"P_inp_xhcff_slice_mask = {P_inp_xhcff_slice_mask} a. u.")
-    P_eff_xacff_slice_mask = np.sum(p_eff_list[slice_mask])
-    print(f"P_eff_xacff_slice_mask = {P_eff_xacff_slice_mask} a. u.")
-    P_inp_xhcff_anti_slice_mask = np.sum(P_inp_xhcff_list[anti_slice_mask])
-    print(f"P_inp_xhcff_anti_slice_mask = {P_inp_xhcff_anti_slice_mask} a. u.")
-    P_eff_xacff_anti_slice_mask = np.sum(p_eff_list[anti_slice_mask])
-    print(f"P_eff_xacff_anti_slice_mask = {P_eff_xacff_anti_slice_mask} a. u.")
+    if not math.isclose(p_eff, np.mean(p_eff_list), abs_tol=0.00000000000001):
+        raise ValueError(f"The effective pressure of {p_eff} a.u. can no longer be established, as the mean pressure is {np.mean(p_eff_list)} a.u.! \nPlease try again using a smaller width than {plane_width} Bohr!")
 
-    print(f"X-HCFF total sum: {np.sum(P_inp_xhcff_list)} a. u.")
-    print(f"X-ACFF total sum: {np.sum(p_eff_list)} a. u.")
-
-    print(np.min(p_eff_list))
-    print(np.max(p_eff_list))
-    print(f"p_eff_list = {p_eff_list}")
-    print(f"P_inp = {p_eff} a.u.")
-    print(f"P_eff = {np.mean(p_eff_list)} a.u.")
+    print(f"P_inp = {p_eff:.14f} a.u.")
+    print(f"P_eff = {np.mean(p_eff_list):.14f} a.u.")
         
 
     # External gradient contribution
