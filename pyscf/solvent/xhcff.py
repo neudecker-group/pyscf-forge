@@ -20,8 +20,8 @@ from pyscf.solvent.grad.pcm import get_dF_dA
 MPA_TO_AU = 3.3989309735473356e-08
 
 
-def build_surface(mol, npoints=302, scaling_factor=1.0):
-    rad = scaling_factor * modified_Bondi
+def build_surface(mol, npoints=302, scaling_factor=1.0, proberad=0.0):
+    rad = scaling_factor * modified_Bondi + proberad
     surf = gen_surface(mol, ng=npoints, rad=rad)
     atom_idx = np.zeros(len(surf['area']), dtype=np.int32)
     for ia, (p0, p1) in enumerate(surf['gslice_by_atom']):
@@ -35,7 +35,7 @@ def surface_normals(atom_coords, grid_coords, atom_idx):
 
 
 def xhcff_external_terms(mol, pressure_mpa=50_000.0, npoints=302, scaling_factor=1.0,
-                         rescale_forces=True):
+                         rescale_forces=True, proberad=0.0):
     """Return (g_ext, h_ext) for X-HCFF.
 
     Args:
@@ -44,6 +44,7 @@ def xhcff_external_terms(mol, pressure_mpa=50_000.0, npoints=302, scaling_factor
         npoints: Lebedev points per atom
         scaling_factor: vdW cavity scaling factor
         rescale_forces: Apply 1/s^2 force rescaling if True
+        proberad: Probe radius in Bohr added to the scaled vdW radii (default 0.0)
 
     Returns:
         g_ext: external gradient contribution, shape (natm,3)
@@ -52,7 +53,7 @@ def xhcff_external_terms(mol, pressure_mpa=50_000.0, npoints=302, scaling_factor
     natm = mol.natm
     coords = mol.atom_coords()
 
-    surf, atom_idx = build_surface(mol, npoints=npoints, scaling_factor=scaling_factor)
+    surf, atom_idx = build_surface(mol, npoints=npoints, scaling_factor=scaling_factor, proberad=proberad)
     area = surf['area']
     grid = surf['grid_coords']
     nvec = surface_normals(coords, grid, atom_idx)
