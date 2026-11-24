@@ -14,8 +14,8 @@
 
 '''
 Tests for the GOSTSASH anisotropic pressure distribution
-p_t = P * x_t^f / M, M = sum(A x^f) / sum(A), x_t = |d_t| / (plane_width / 2),
-with a fixed exponent f.
+p_t = P * |d_t|^f / M, M = sum(A |d|^f) / sum(A), d_t = distance to the plane,
+with a fixed exponent f (no plane width: it would cancel out of p_t).
 '''
 
 import unittest
@@ -73,8 +73,7 @@ CP_DISTORTED = [
 
 
 def make_options(atom_list, f, **kw):
-    opts = dict(npoints=110, atom_list=atom_list, plane_width=1.0,
-                pressure_mpa=10000, f_exponent=f)
+    opts = dict(npoints=110, atom_list=atom_list, pressure_mpa=10000, f_exponent=f)
     opts.update(kw)
     return opts
 
@@ -116,6 +115,10 @@ class TestGOSTSASHOptions(unittest.TestCase):
         with self.assertRaises(ValueError):
             GOSTSASH(make_mol(NH3), make_options([0, 1, 2], '4'))
 
+    def test_plane_width_removed(self):
+        with self.assertRaises(ValueError):
+            GOSTSASH(make_mol(NH3), make_options([0, 1, 2], 4, plane_width=1.0))
+
 
 class TestGOSTSASHPressureDistribution(unittest.TestCase):
 
@@ -130,8 +133,9 @@ class TestGOSTSASHPressureDistribution(unittest.TestCase):
         g = GOSTSASH(make_mol(CP, unit='Ang'), make_options([0, 1, 2], 4))
         order = np.argsort(g.abs_distances)
         self.assertTrue(np.all(np.diff(g.pressure_au_list[order]) >= 0))
-        band = g.abs_distances <= g.half_width
-        self.assertTrue(np.all(g.pressure_au_list[band] < g.pressure_au))
+        inner = g.abs_distances < g.crossover_distance
+        self.assertTrue(np.all(g.pressure_au_list[inner] < g.pressure_au))
+        self.assertTrue(np.all(g.pressure_au_list[~inner] >= g.pressure_au))
         self.assertGreater(np.max(g.pressure_au_list), g.pressure_au)
 
     def test_dpressure_dX_finite_difference(self):
@@ -214,8 +218,7 @@ class TestGOSTSASHOrientation(unittest.TestCase):
 class TestSmallAreaPoints(unittest.TestCase):
     """Surface points with area <= MIN_SURFACE_AREA are removed (distorted Cp)."""
 
-    OPTS = dict(npoints=110, atom_list=[0, 8, 9], plane_width=1.0,
-                pressure_mpa=10000, f_exponent=4)
+    OPTS = dict(npoints=110, atom_list=[0, 8, 9], pressure_mpa=10000, f_exponent=4)
 
     def test_small_points_removed(self):
         g = GOSTSASH(make_mol(CP_DISTORTED), dict(self.OPTS))

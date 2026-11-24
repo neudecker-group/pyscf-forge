@@ -141,11 +141,12 @@ class GOSTSASH(lib.StreamObject):
         If True, compute integrals on-the-fly without caching (default: True).
     f_exponent : float
         Exponent f of the anisotropic pressure distribution (required, no default).
-        Each surface point t gets p_t = P * x_t**f / M with
-        x_t = |d_t| / (plane_width / 2) and the area-weighted mean
-        M = sum(A_t x_t**f) / sum(A_t), so the area-weighted mean pressure is exactly P.
-        Larger f concentrates the load on the poles far from the plane.
-        Must be >= 1 (the analytic gradient contains x**(f-1)).
+        Each surface point t gets p_t = P * |d_t|**f / M, where d_t is the distance
+        to the plane through the atoms in atom_list and M = sum(A_t |d_t|**f) / sum(A_t)
+        is the area-weighted mean, so the area-weighted mean pressure is exactly P.
+        Larger f concentrates the load on the poles far from the plane; p_t = P at
+        |d| = M**(1/f). Must be >= 1 (the analytic gradient contains |d|**(f-1)).
+        There is no plane width: it would cancel out of p_t.
     """
 
     def __init__(self, mol, options=None):
@@ -169,7 +170,10 @@ class GOSTSASH(lib.StreamObject):
             self.atom1 = self.atom_list[0]
             self.atom2 = self.atom_list[1]
             self.atom3 = self.atom_list[2]
-        self.plane_width = options.get('plane_width', 1.0) # Bohr (0.53 Ang)
+        if 'plane_width' in options:
+            raise ValueError("The option 'plane_width' was removed: it cancels out of the normalised "
+                             "pressure distribution p_t = P |d_t|^f / <|d|^f>_A. Only f_exponent "
+                             "controls the anisotropy.")
         # no default on purpose: f has not been benchmarked yet
         self.f_exponent = options.get('f_exponent', None)
         if self.f_exponent is None:
@@ -289,32 +293,24 @@ class GOSTSASH(lib.StreamObject):
         self.distances = np.dot(self.surface_dict['grid_coords'], self.n0) - o
         self.abs_distances = np.abs(self.distances)
 
-        # masking and filtering of the grid coordinates using plane width as a margin to both sides:
-        self.half_width = self.plane_width / 2.
-        self.base_fraction = self.abs_distances / self.half_width
-        logger.info(self, f"half_width = {self.half_width:.3f} Bohr")
-        slice_mask = self.abs_distances <= self.half_width
-        logger.info(self, f"Tess. points in cylindrical part: {(np.count_nonzero(slice_mask) / len(self.distances)) * 100:.3f} percent.")
-        if np.count_nonzero(slice_mask) == len(self.distances):
-            raise ValueError(f"It is not possible to create reasonable half-shells! \nPlease try again using a smaller width than {self.plane_width} Bohr!")
-
-        # p_t = P * x_t^f / <x^f>_A: monotonic in the distance to the plane, area-weighted
-        # mean exactly P. Area weighting keeps the energy continuous when a surface point
-        # appears or disappears (its weight goes to zero with its area); with a plain mean
-        # the number of points would enter M and every pressure would jump.
+        # p_t = P * |d_t|^f / M, M = sum(A |d|^f) / sum(A): monotonic in the distance to
+        # the plane, area-weighted mean exactly P (total load P * sum(A) as in GOSTSHYP).
+        # Area weighting keeps the energy continuous when a surface point appears or
+        # disappears (its weight goes to zero with its area). A plane width would cancel
+        # out of this ratio, so there is none: the pressure equals P at the distance
+        # d* = M^(1/f), which follows from f and the geometry.
         area = self.surface_dict['area']
-        self.x_pow_f = self.base_fraction ** self.f_exponent
-        self.mean_x_pow_f = np.dot(area, self.x_pow_f) / np.sum(area)
-        # band points (x <= 1) only get less than P if <x^f> > 1
-        if self.mean_x_pow_f <= 1.0:
-            raise ValueError(f"The pressure inside the plane band would not be reduced (<x^f> = {self.mean_x_pow_f:.4f} <= 1)! \nPlease try again using a smaller width than {self.plane_width} Bohr!")
+        self.d_pow_f = self.abs_distances ** self.f_exponent
+        self.mean_d_pow_f = np.dot(area, self.d_pow_f) / np.sum(area)
+        self.pressure_au_list = self.pressure_au * self.d_pow_f / self.mean_d_pow_f
 
-        self.pressure_au_list = self.pressure_au * self.x_pow_f / self.mean_x_pow_f
-
-        crossover = self.mean_x_pow_f ** (1.0 / self.f_exponent) * self.half_width
+        self.crossover_distance = self.mean_d_pow_f ** (1.0 / self.f_exponent)
+        relieved = self.abs_distances < self.crossover_distance
         logger.info(self, f"f_exponent = {self.f_exponent}")
-        logger.info(self, f"<x^f> = {self.mean_x_pow_f:.6e}")
-        logger.info(self, f"p_t = P_inp at {crossover:.3f} Bohr from the plane")
+        logger.info(self, f"<|d|^f>_A = {self.mean_d_pow_f:.6e} Bohr^f")
+        logger.info(self, f"p_t = P_inp at d* = {self.crossover_distance:.3f} Bohr from the plane "
+                          f"(max |d| = {self.abs_distances.max():.3f} Bohr)")
+        logger.info(self, f"p_t < P_inp on {100 * area[relieved].sum() / area.sum():.1f} percent of the surface area")
         logger.info(self, f"p_t / P_inp: min = {np.min(self.pressure_au_list) / self.pressure_au:.3e}, "
                           f"max = {np.max(self.pressure_au_list) / self.pressure_au:.3f}")
         logger.info(self, f"P_inp = {self.pressure_au:.14f} a.u.")
@@ -380,14 +376,14 @@ class GOSTSASH(lib.StreamObject):
 
     def compute_dpressure_dX(self, dareas):
         """
-        Derivative of the per-point pressure p_t = P * x_t^f / M with the
-        area-weighted mean M = sum_t A_t x_t^f / sum_t A_t,
-        x_t = |d_t| / half_width, d_t = n0 . (r_t - x1), with respect to all
-        nuclear coordinates lambda = (atom, cartesian component):
+        Derivative of the per-point pressure p_t = P * |d_t|^f / M with the
+        area-weighted mean M = sum_t A_t |d_t|^f / sum_t A_t,
+        d_t = n0 . (r_t - x1), with respect to all nuclear coordinates
+        lambda = (atom, cartesian component):
 
-            dp_t/dlambda = (P / M) * [u_t - x_t^f * (dM/dlambda) / M],
-            u_t = (f / half_width) * sign(d_t) * x_t^(f-1) * dd_t/dlambda,
-            dM/dlambda = [sum_t (dA_t/dlambda x_t^f + A_t u_t) - M sum_t dA_t/dlambda] / sum_t A_t
+            dp_t/dlambda = (P / M) * [u_t - |d_t|^f * (dM/dlambda) / M],
+            u_t = f * sign(d_t) * |d_t|^(f-1) * dd_t/dlambda,
+            dM/dlambda = [sum_t (dA_t/dlambda |d_t|^f + A_t u_t) - M sum_t dA_t/dlambda] / sum_t A_t
 
         f is a fixed input parameter, so there is no df/dlambda term.
             dareas: dA_t/dlambda of the areas used in the energy, shape (natm, 3, ngrid)
@@ -412,17 +408,17 @@ class GOSTSASH(lib.StreamObject):
                 ddt_dlambda_all[i, c, :] = (dut_dlambda_n0 - dx1_dlambda_n0) + dn0_dlambda_u_t_x1
 
         f = self.f_exponent
-        # d(x_t^f)/dd_t; f >= 1, so finite also for points on the plane (sign(0) = 0)
-        dxf_ddt = (f / self.half_width) * np.sign(self.distances) * self.base_fraction ** (f - 1)
-        u = ddt_dlambda_all * dxf_ddt[np.newaxis, np.newaxis, :]   # d(x_t^f)/dlambda
+        # d(|d_t|^f)/dd_t; f >= 1, so finite also for points on the plane (sign(0) = 0)
+        ddf_ddt = f * np.sign(self.distances) * self.abs_distances ** (f - 1)
+        u = ddt_dlambda_all * ddf_ddt[np.newaxis, np.newaxis, :]   # d(|d_t|^f)/dlambda
 
-        M = self.mean_x_pow_f
+        M = self.mean_d_pow_f
         area = self.surface_dict['area']
-        dM_dlambda = (np.einsum('acg,g->ac', dareas, self.x_pow_f)
+        dM_dlambda = (np.einsum('acg,g->ac', dareas, self.d_pow_f)
                       + np.einsum('g,acg->ac', area, u)
                       - M * np.sum(dareas, axis=2)) / np.sum(area)
         return (self.pressure_au / M) * (
-            u - self.x_pow_f[np.newaxis, np.newaxis, :] * (dM_dlambda / M)[:, :, np.newaxis])
+            u - self.d_pow_f[np.newaxis, np.newaxis, :] * (dM_dlambda / M)[:, :, np.newaxis])
 
     def dump_flags(self, verbose=None):
         logger.info(self, '******** %s ********', self.__class__)
@@ -439,7 +435,6 @@ class GOSTSASH(lib.StreamObject):
         logger.info(self, 'atom1 = %i', self.atom1)
         logger.info(self, 'atom2 = %i', self.atom2)
         logger.info(self, 'atom3 = %i', self.atom3)
-        logger.info(self, 'plane_width = %.4f Bohr', self.plane_width)
         logger.info(self, 'f_exponent = %.4f', self.f_exponent)
         return self
 
@@ -462,8 +457,6 @@ class GOSTSASH(lib.StreamObject):
             raise ValueError(f"atom_list must be a list of exactly 3 atom indices, got '{self.atom_list}'")
         if not isinstance(self.atom1, int) or not isinstance(self.atom2, int) or not isinstance(self.atom3, int):
             raise ValueError(f"atom_list must be a list of exactly 3 atom indices of type int, got '[{self.atom1}, {self.atom2}, {self.atom3}]'")
-        if self.plane_width <= 0.0:
-            raise ValueError(f'plane_width must be positive, got {self.plane_width}')
 
         return self
 

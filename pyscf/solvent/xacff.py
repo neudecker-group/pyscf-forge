@@ -102,15 +102,15 @@ def dnormal_dX(natm, atom_list, p1, p2, p3):
     return dn0
 
 
-def dpressure_dX(p_eff, x_pow_f, mean_x_pow_f, base_fraction, distances, half_width,
-                 f_exponent, area, dareas, grid, atom_idx, atom_list, p1, p2, p3, normal):
-    """Derivative of p_t = P * x_t^f / M, M = sum(A x^f) / sum(A), with respect to all
+def dpressure_dX(p_eff, d_pow_f, mean_d_pow_f, distances, f_exponent, area, dareas,
+                 grid, atom_idx, atom_list, p1, p2, p3, normal):
+    """Derivative of p_t = P * |d_t|^f / M, M = sum(A |d|^f) / sum(A), with respect to all
     nuclear coordinates lambda (same as GOSTSASH Term 4):
 
-        dp_t/dlambda = (P / M) * [u_t - x_t^f * (dM/dlambda) / M],
-        u_t = (f / half_width) * sign(d_t) * x_t^(f-1) * dd_t/dlambda,
+        dp_t/dlambda = (P / M) * [u_t - |d_t|^f * (dM/dlambda) / M],
+        u_t = f * sign(d_t) * |d_t|^(f-1) * dd_t/dlambda,
         dd_t/dlambda = delta(B, A(t)) n0_c - delta(B, atom1) n0_c + dn0/dlambda . (r_t - x1),
-        dM/dlambda = [sum_t (dA_t x_t^f + A_t u_t) - M sum_t dA_t] / sum_t A_t
+        dM/dlambda = [sum_t (dA_t |d_t|^f + A_t u_t) - M sum_t dA_t] / sum_t A_t
 
     p_eff: input pressure P (after force rescaling), dareas: shape (natm, 3, ngrid).
     Returns shape (natm, 3, ngrid).
@@ -124,11 +124,11 @@ def dpressure_dX(p_eff, x_pow_f, mean_x_pow_f, base_fraction, distances, half_wi
         ddt[ia][:, atom_idx == ia] += normal[:, None]
     ddt[atom_list[0]] -= normal[:, None]
 
-    u = ddt * ((f_exponent / half_width) * np.sign(distances) * base_fraction ** (f_exponent - 1))
-    M = mean_x_pow_f
-    dM = (np.einsum('acg,g->ac', dareas, x_pow_f) + np.einsum('g,acg->ac', area, u)
+    u = ddt * (f_exponent * np.sign(distances) * np.abs(distances) ** (f_exponent - 1))
+    M = mean_d_pow_f
+    dM = (np.einsum('acg,g->ac', dareas, d_pow_f) + np.einsum('g,acg->ac', area, u)
           - M * dareas.sum(axis=2)) / area.sum()
-    return (p_eff / M) * (u - x_pow_f * (dM / M)[:, :, None])
+    return (p_eff / M) * (u - d_pow_f * (dM / M)[:, :, None])
 
 
 def xacff_external_terms(mol, pressure_mpa=50_000.0, npoints=302, scaling_factor=1.0,
@@ -143,12 +143,12 @@ def xacff_external_terms(mol, pressure_mpa=50_000.0, npoints=302, scaling_factor
         scaling_factor: vdW cavity scaling factor
         rescale_forces: Apply 1/s^2 force rescaling if True
         atom_list: three atom indices defining the plane
-        plane_width: width of the band around the plane in Bohr
+        plane_width: removed (raises ValueError); it cancels out of p_t
         f_exponent: exponent f of the anisotropic pressure distribution
             (required, no default, >= 1). Each surface point t gets
-            p_t = P * x_t**f / M with x_t = |d_t| / (plane_width / 2) and the
-            area-weighted mean M = sum(A_t x_t**f) / sum(A_t), so the total load
-            sum(p_t A_t) equals P * sum(A_t) as in X-HCFF.
+            p_t = P * |d_t|**f / M with the distance d_t to the plane and the
+            area-weighted mean M = sum(A_t |d_t|**f) / sum(A_t), so the total load
+            sum(p_t A_t) equals P * sum(A_t) as in X-HCFF; p_t = P at |d| = M**(1/f).
         symmetrize: return 0.5 (H + H^T) (default). The X-ACFF force is not the
             gradient of an energy, so its Jacobian is not symmetric in general;
             False returns the plain Jacobian d g_ext / dX.
@@ -158,6 +158,10 @@ def xacff_external_terms(mol, pressure_mpa=50_000.0, npoints=302, scaling_factor
         h_ext: external Hessian contribution, shape (natm,natm,3,3)
     """
     f_exponent = check_f_exponent(f_exponent)
+    if plane_width is not None:
+        raise ValueError("The option 'plane_width' was removed: it cancels out of the normalised "
+                         "pressure distribution p_t = P |d_t|^f / <|d|^f>_A. Only f_exponent "
+                         "controls the anisotropy.")
 
     if atom_list is None:
         raise ValueError(f"You have not specified a list of three atoms to construct a plane from!")
@@ -198,37 +202,21 @@ def xacff_external_terms(mol, pressure_mpa=50_000.0, npoints=302, scaling_factor
 
     distances = np.dot(grid, normal_normalised) - d
 
-    if plane_width is None:
-        raise ValueError(f"You have to specify the width of the family of planes (in Bohr) to construct the half-shells from!")
-    if plane_width <= 0.0:
-        raise ValueError(f'plane_width must be positive, got {plane_width} Bohr')
-        
-    half_width = plane_width / 2.
-
-    slice_mask = np.abs(distances) <= half_width
-    print(f"Tess. points in cylindrical part: {(np.count_nonzero(slice_mask) / len(distances)) * 100:.3f} %")
-    if np.count_nonzero(slice_mask) == len(distances):
-        raise ValueError(f"It is not possible to create reasonable half-shells! \nPlease try again using a smaller width than {plane_width} Bohr!")
-    print(f"half_width = {half_width:.3f} Bohr")
-
-
     p_au = pressure_mpa * MPA_TO_AU
     scale = 1.0 / (scaling_factor ** 2) if rescale_forces else 1.0
     p_eff = p_au * scale
 
-    # p_t = P * x_t^f / M with the area-weighted mean M = sum(A x^f) / sum(A):
+    # p_t = P * |d_t|^f / M with the area-weighted mean M = sum(A |d|^f) / sum(A):
     # monotonic in the distance to the plane, total load sum(p A) = P sum(A) as in X-HCFF
-    base_fraction = np.abs(distances) / half_width
-    x_pow_f = base_fraction ** f_exponent
-    mean_x_pow_f = np.dot(area, x_pow_f) / np.sum(area)
-    # band points (x <= 1) only get less than P if M > 1
-    if mean_x_pow_f <= 1.0:
-        raise ValueError(f"The pressure inside the plane band would not be reduced (<x^f> = {mean_x_pow_f:.4f} <= 1)! \nPlease try again using a smaller width than {plane_width} Bohr!")
-    p_eff_list = p_eff * x_pow_f / mean_x_pow_f
+    abs_distances = np.abs(distances)
+    d_pow_f = abs_distances ** f_exponent
+    mean_d_pow_f = np.dot(area, d_pow_f) / np.sum(area)
+    p_eff_list = p_eff * d_pow_f / mean_d_pow_f
 
+    crossover = mean_d_pow_f ** (1.0 / f_exponent)
     print(f"f_exponent = {f_exponent}")
-    print(f"<x^f> = {mean_x_pow_f:.6e}")
-    print(f"p_t = P_inp at {mean_x_pow_f ** (1.0 / f_exponent) * half_width:.3f} Bohr from the plane")
+    print(f"<|d|^f>_A = {mean_d_pow_f:.6e} Bohr^f")
+    print(f"p_t = P_inp at d* = {crossover:.3f} Bohr from the plane (max |d| = {abs_distances.max():.3f} Bohr)")
     print(f"P_inp = {p_eff:.14f} a.u.")
     print(f"P_eff = {np.dot(area, p_eff_list) / np.sum(area):.14f} a.u. (area-weighted mean)")
 
@@ -246,9 +234,8 @@ def xacff_external_terms(mol, pressure_mpa=50_000.0, npoints=302, scaling_factor
     # its atom), so d q_t = n_t (p_t dA_t + A_t dp_t).
     _, dA = get_dF_dA(surf)                       # (ngrid, natm, 3)
     dareas = dA.transpose(1, 2, 0)                # (natm, 3, ngrid)
-    dp = dpressure_dX(p_eff, x_pow_f, mean_x_pow_f, base_fraction, distances, half_width,
-                      f_exponent, area, dareas, grid, atom_idx, atom_list, a1, a2, a3,
-                      normal_normalised)
+    dp = dpressure_dX(p_eff, d_pow_f, mean_d_pow_f, distances, f_exponent, area, dareas,
+                      grid, atom_idx, atom_list, a1, a2, a3, normal_normalised)
     dq_scalar = p_eff_list * dareas + area * dp   # (natm, 3, ngrid): d(p_t A_t)/dX_jb
     h_ext = np.zeros((natm, natm, 3, 3))
 

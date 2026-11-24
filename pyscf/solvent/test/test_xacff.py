@@ -14,7 +14,7 @@
 
 '''
 Tests for X-ACFF with the anisotropic pressure distribution
-p_t = P * x_t^f / M, M = sum(A x^f) / sum(A), x_t = |d_t| / (plane_width / 2).
+p_t = P * |d_t|^f / M, M = sum(A |d|^f) / sum(A), d_t = distance to the plane.
 '''
 
 import unittest
@@ -51,8 +51,7 @@ def make_mol(atom):
 
 def options(atom_list, f, **kw):
     opts = dict(pressure_mpa=10_000.0, npoints=110, scaling_factor=1.2,
-                rescale_forces=True, atom_list=list(atom_list), plane_width=1.0,
-                f_exponent=f)
+                rescale_forces=True, atom_list=list(atom_list), f_exponent=f)
     opts.update(kw)
     return opts
 
@@ -89,6 +88,10 @@ class TestXACFFOptions(unittest.TestCase):
     def test_f_exponent_not_a_number(self):
         with self.assertRaises(ValueError):
             xacff_external_terms(make_mol(NH3_DISTORTED), **options([0, 1, 2], '4'))
+
+    def test_plane_width_removed(self):
+        with self.assertRaises(ValueError):
+            xacff_external_terms(make_mol(NH3_DISTORTED), **options([0, 1, 2], 4, plane_width=1.0))
 
 
 class TestXACFFGradient(unittest.TestCase):
