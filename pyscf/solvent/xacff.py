@@ -15,8 +15,6 @@ from pyscf.grad import rhf as rhf_grad
 from pyscf.hessian import rhf as rhf_hess
 from pyscf.solvent.pcm import gen_surface, modified_Bondi
 from pyscf.solvent.grad.pcm import get_dF_dA
-from scipy.optimize import fsolve
-import math
 
 # 1 MPa in Eh/Bohr^3
 MPA_TO_AU = 3.3989309735473356e-08
@@ -70,8 +68,72 @@ def create_plane(p1, p2, p3):
 
     return normal_normalised, d
 
+
+def check_f_exponent(f_exponent):
+    """Validate the exponent of the anisotropic pressure distribution and return it as float."""
+    # no default on purpose: f has not been benchmarked yet
+    if f_exponent is None:
+        raise ValueError("X-ACFF requires the option 'f_exponent' (exponent of the anisotropic "
+                         "pressure distribution, e.g. f_exponent=4). There is no default value.")
+    if isinstance(f_exponent, bool) or not isinstance(f_exponent, (int, float)):
+        raise ValueError(f"f_exponent must be a number, got '{f_exponent}'")
+    if f_exponent < 1.0:
+        raise ValueError(f"f_exponent must be >= 1, got {f_exponent}")
+    return float(f_exponent)
+
+
+def dnormal_dX(natm, atom_list, p1, p2, p3):
+    """Derivative of the unit plane normal n0 with respect to all nuclear coordinates.
+
+    Only the three plane atoms contribute. Returns shape (natm, 3, 3): [atom, cartesian, n0 component].
+    """
+    n = np.cross(p2 - p1, p3 - p1)
+    n_norm = np.linalg.norm(n)
+    n0 = n / n_norm
+    dn0 = np.zeros((natm, 3, 3))
+    for c in range(3):
+        ec = np.zeros(3)
+        ec[c] = 1.0
+        dn_dx2 = np.cross(ec, p3 - p1)
+        dn_dx3 = np.cross(p2 - p1, ec)
+        dn_dx1 = -dn_dx2 - dn_dx3
+        for ia, dn in zip(atom_list, (dn_dx1, dn_dx2, dn_dx3)):
+            dn0[ia, c] = (dn - np.dot(n0, dn) * n0) / n_norm
+    return dn0
+
+
+def dpressure_dX(p_eff, x_pow_f, mean_x_pow_f, base_fraction, distances, half_width,
+                 f_exponent, area, dareas, grid, atom_idx, atom_list, p1, p2, p3, normal):
+    """Derivative of p_t = P * x_t^f / M, M = sum(A x^f) / sum(A), with respect to all
+    nuclear coordinates lambda (same as GOSTSASH Term 4):
+
+        dp_t/dlambda = (P / M) * [u_t - x_t^f * (dM/dlambda) / M],
+        u_t = (f / half_width) * sign(d_t) * x_t^(f-1) * dd_t/dlambda,
+        dd_t/dlambda = delta(B, A(t)) n0_c - delta(B, atom1) n0_c + dn0/dlambda . (r_t - x1),
+        dM/dlambda = [sum_t (dA_t x_t^f + A_t u_t) - M sum_t dA_t] / sum_t A_t
+
+    p_eff: input pressure P (after force rescaling), dareas: shape (natm, 3, ngrid).
+    Returns shape (natm, 3, ngrid).
+    """
+    natm = dareas.shape[0]
+    dn0 = dnormal_dX(natm, atom_list, p1, p2, p3)
+    # dd_t/dlambda, (natm, 3, ngrid): grid points move rigidly with their atom,
+    # the plane moves with its three atoms
+    ddt = np.einsum('acn,gn->acg', dn0, grid - p1)
+    for ia in range(natm):
+        ddt[ia][:, atom_idx == ia] += normal[:, None]
+    ddt[atom_list[0]] -= normal[:, None]
+
+    u = ddt * ((f_exponent / half_width) * np.sign(distances) * base_fraction ** (f_exponent - 1))
+    M = mean_x_pow_f
+    dM = (np.einsum('acg,g->ac', dareas, x_pow_f) + np.einsum('g,acg->ac', area, u)
+          - M * dareas.sum(axis=2)) / area.sum()
+    return (p_eff / M) * (u - x_pow_f * (dM / M)[:, :, None])
+
+
 def xacff_external_terms(mol, pressure_mpa=50_000.0, npoints=302, scaling_factor=1.0,
-                         rescale_forces=True, atom_list = None, plane_width = None):
+                         rescale_forces=True, atom_list = None, plane_width = None,
+                         f_exponent = None, symmetrize=True):
     """Return (g_ext, h_ext) for X-ACFF.
 
     Args:
@@ -80,11 +142,22 @@ def xacff_external_terms(mol, pressure_mpa=50_000.0, npoints=302, scaling_factor
         npoints: Lebedev points per atom
         scaling_factor: vdW cavity scaling factor
         rescale_forces: Apply 1/s^2 force rescaling if True
+        atom_list: three atom indices defining the plane
+        plane_width: width of the band around the plane in Bohr
+        f_exponent: exponent f of the anisotropic pressure distribution
+            (required, no default, >= 1). Each surface point t gets
+            p_t = P * x_t**f / M with x_t = |d_t| / (plane_width / 2) and the
+            area-weighted mean M = sum(A_t x_t**f) / sum(A_t), so the total load
+            sum(p_t A_t) equals P * sum(A_t) as in X-HCFF.
+        symmetrize: return 0.5 (H + H^T) (default). The X-ACFF force is not the
+            gradient of an energy, so its Jacobian is not symmetric in general;
+            False returns the plain Jacobian d g_ext / dX.
 
     Returns:
         g_ext: external gradient contribution, shape (natm,3)
         h_ext: external Hessian contribution, shape (natm,natm,3,3)
     """
+    f_exponent = check_f_exponent(f_exponent)
 
     if atom_list is None:
         raise ValueError(f"You have not specified a list of three atoms to construct a plane from!")
@@ -139,25 +212,25 @@ def xacff_external_terms(mol, pressure_mpa=50_000.0, npoints=302, scaling_factor
     print(f"half_width = {half_width:.3f} Bohr")
 
 
-    def match_average_objective(f):
-        """Solves numerically for exponent f, so that the mean of the final array list equals a predefined value"""
-        return np.mean((np.abs(distances) / half_width) ** f) - 1.0
-        
-    f_optimised = fsolve(match_average_objective, x0 = 50.0, full_output= 1)[0]
-    print(f"f_optimised = {f_optimised}")
-
     p_au = pressure_mpa * MPA_TO_AU
     scale = 1.0 / (scaling_factor ** 2) if rescale_forces else 1.0
     p_eff = p_au * scale
-        
-    p_eff_list = p_eff * (np.abs(distances) / half_width) ** f_optimised
 
-    if not math.isclose(p_eff, np.mean(p_eff_list), abs_tol=0.00000000000001):
-        raise ValueError(f"The effective pressure of {p_eff} a.u. can no longer be established, as the mean pressure is {np.mean(p_eff_list)} a.u.! \nPlease try again using a smaller width than {plane_width} Bohr!")
+    # p_t = P * x_t^f / M with the area-weighted mean M = sum(A x^f) / sum(A):
+    # monotonic in the distance to the plane, total load sum(p A) = P sum(A) as in X-HCFF
+    base_fraction = np.abs(distances) / half_width
+    x_pow_f = base_fraction ** f_exponent
+    mean_x_pow_f = np.dot(area, x_pow_f) / np.sum(area)
+    # band points (x <= 1) only get less than P if M > 1
+    if mean_x_pow_f <= 1.0:
+        raise ValueError(f"The pressure inside the plane band would not be reduced (<x^f> = {mean_x_pow_f:.4f} <= 1)! \nPlease try again using a smaller width than {plane_width} Bohr!")
+    p_eff_list = p_eff * x_pow_f / mean_x_pow_f
 
+    print(f"f_exponent = {f_exponent}")
+    print(f"<x^f> = {mean_x_pow_f:.6e}")
+    print(f"p_t = P_inp at {mean_x_pow_f ** (1.0 / f_exponent) * half_width:.3f} Bohr from the plane")
     print(f"P_inp = {p_eff:.14f} a.u.")
-    print(f"P_eff = {np.mean(p_eff_list):.14f} a.u.")
-        
+    print(f"P_eff = {np.dot(area, p_eff_list) / np.sum(area):.14f} a.u. (area-weighted mean)")
 
     # External gradient contribution
     sum_all = np.einsum('t,t,tx->x', p_eff_list, area, nvec, optimize=True)
@@ -168,20 +241,27 @@ def xacff_external_terms(mol, pressure_mpa=50_000.0, npoints=302, scaling_factor
         sum_i = np.einsum('t,t,tx->x', p_eff_list[mask], area[mask], nvec[mask], optimize=True)
         g_ext[ia] = -sum_i + sum_all / natm
 
-    # Analytic external Hessian contribution from dA/dR
-    _, dA = get_dF_dA(surf)
+    # Analytic external Hessian: derivative of q_t = p_t A_t n_t. The normals
+    # n_t = (X_A(t) - r_t) / |X_A(t) - r_t| do not change (r_t moves rigidly with
+    # its atom), so d q_t = n_t (p_t dA_t + A_t dp_t).
+    _, dA = get_dF_dA(surf)                       # (ngrid, natm, 3)
+    dareas = dA.transpose(1, 2, 0)                # (natm, 3, ngrid)
+    dp = dpressure_dX(p_eff, x_pow_f, mean_x_pow_f, base_fraction, distances, half_width,
+                      f_exponent, area, dareas, grid, atom_idx, atom_list, a1, a2, a3,
+                      normal_normalised)
+    dq_scalar = p_eff_list * dareas + area * dp   # (natm, 3, ngrid): d(p_t A_t)/dX_jb
     h_ext = np.zeros((natm, natm, 3, 3))
 
     for ia in range(natm):
         mask_i = atom_idx == ia
         for ja in range(natm):
-            dA_ja = dA[:, ja, :]
-            term_i = np.einsum('t,ta,tb->ab', p_eff_list[mask_i], nvec[mask_i], dA_ja[mask_i], optimize=True)
-            term_all = np.einsum('t,ta,tb->ab', p_eff_list, nvec, dA_ja, optimize=True)
+            term_i = np.einsum('ta,bt->ab', nvec[mask_i], dq_scalar[ja][:, mask_i], optimize=True)
+            term_all = np.einsum('ta,bt->ab', nvec, dq_scalar[ja], optimize=True)
             h_ext[ia, ja] = -term_i + term_all / natm
 
     # Symmetrize per analytic Hessian formulation
-    h_ext = 0.5 * (h_ext + np.transpose(h_ext, (1, 0, 3, 2)))
+    if symmetrize:
+        h_ext = 0.5 * (h_ext + np.transpose(h_ext, (1, 0, 3, 2)))
     return g_ext, h_ext
 
 
