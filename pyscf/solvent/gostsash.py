@@ -31,11 +31,10 @@ from functools import cached_property
 from pyscf import gto, lib, scf
 from pyscf.lib import logger
 from pyscf.solvent import _attach_solvent
-from pyscf.solvent.pcm import gen_surface, modified_Bondi
+from pyscf.solvent.pcm import modified_Bondi
 from pyscf.solvent.grad.pcm import get_dF_dA
+from pyscf.solvent.gostshyp import gen_pressure_surface, MIN_SURFACE_AREA
 import os
-from scipy.optimize import fsolve
-import math
 
 # Pressure conversion: 1 MPa = 3.3989309735473356e-08 Hartree/Bohr^3
 MPA_TO_AU = 3.3989309735473356e-08
@@ -120,42 +119,6 @@ def compute_surface_normals(atom_coords, grid, atom_idx):
             'surface tessellation is degenerate.')
     return dr / dr_norm
 
-
-def create_plane(p1, p2, p3):
-    """
-    Creates a plane from 3 points in space.
-    p3
-    ^ 
-    |(v2)
-    p1 -(v1)-> p2
-    Calculates normal vector and distance d of those 3 points.
-
-    Parameters
-    ----------
-    p1, p2, p3 : np.array
-    """
-    
-    # the two connecting vectors form the plane
-    v1 = p2 - p1
-    v2 = p3 - p1 
-
-    # cross product of v1 and v2 is orthogonal to them and the normal vector of the plane
-    normal = np.cross(v1, v2)
-    #print(f"normal = {normal}")
-
-    # Normalisation of the normal vector for exact euclidean distances
-    normal_length = np.linalg.norm(normal)
-    if np.abs(normal_length) < 1e-5:
-        raise ValueError("The three atoms lay on a straight line, therefore they cannot form a plane!")
-    # normal_normalised directs from the origin in direction of the plane
-    normal_normalised = normal / normal_length
- 
-    # insert point 1 into plane equation: d = n_0 · p1
-    # d is distance of plane to origin
-    d = np.dot(normal_normalised, p1)
-
-    return normal_normalised, d
-
 class GOSTSASH(lib.StreamObject):
     """
     GOSTSASH pressure solvation model.
@@ -176,6 +139,13 @@ class GOSTSASH(lib.StreamObject):
         Extension radius for vdW/OCC in Bohr (default: 0.4724 ~ 0.25 Ang).
     direct : bool
         If True, compute integrals on-the-fly without caching (default: True).
+    f_exponent : float
+        Exponent f of the anisotropic pressure distribution (required, no default).
+        Each surface point t gets p_t = P * x_t**f / M with
+        x_t = |d_t| / (plane_width / 2) and the area-weighted mean
+        M = sum(A_t x_t**f) / sum(A_t), so the area-weighted mean pressure is exactly P.
+        Larger f concentrates the load on the poles far from the plane.
+        Must be >= 1 (the analytic gradient contains x**(f-1)).
     """
 
     def __init__(self, mol, options=None):
@@ -197,12 +167,19 @@ class GOSTSASH(lib.StreamObject):
         self.atom_list = options.get('atom_list', None)
         if self.atom_list is not None:
             self.atom1 = self.atom_list[0]
-            print(self.atom1)
             self.atom2 = self.atom_list[1]
-            print(self.atom2)
             self.atom3 = self.atom_list[2]
-            print(self.atom3)
         self.plane_width = options.get('plane_width', 1.0) # Bohr (0.53 Ang)
+        # no default on purpose: f has not been benchmarked yet
+        self.f_exponent = options.get('f_exponent', None)
+        if self.f_exponent is None:
+            raise ValueError("GOSTSASH requires the option 'f_exponent' (exponent of the anisotropic "
+                             "pressure distribution, e.g. 'f_exponent': 4). There is no default value.")
+        if isinstance(self.f_exponent, bool) or not isinstance(self.f_exponent, (int, float)):
+            raise ValueError(f"f_exponent must be a number, got '{self.f_exponent}'")
+        if self.f_exponent < 1.0:
+            raise ValueError(f"f_exponent must be >= 1, got {self.f_exponent}")
+        self.f_exponent = float(self.f_exponent)
 
         self.opt_counter = 0
         self.scf_counter = 0
@@ -232,7 +209,8 @@ class GOSTSASH(lib.StreamObject):
         if self.cavity == 'vdw/occ':
             r_ext = self.r_ext
             rad_outer = rad + r_ext
-            self.surface_dict = gen_surface(mol, ng=self.npoints, rad=rad_outer)
+            self.surface_dict, self.n_removed_points = gen_pressure_surface(
+                mol, self.npoints, rad_outer, r_ext=r_ext)
 
             # Save outer surface_dict for gradient computation
             self._outer_surface_dict = dict(self.surface_dict)
@@ -252,7 +230,8 @@ class GOSTSASH(lib.StreamObject):
             self.surface_dict['area'] = area_occ
             self.surface_dict['R_vdw'] = R_inner
         else:
-            self.surface_dict = gen_surface(mol, ng=self.npoints, rad=rad)
+            self.surface_dict, self.n_removed_points = gen_pressure_surface(
+                mol, self.npoints, rad)
             self._outer_surface_dict = None
             self._occ_ratio_sq = None
         
@@ -284,51 +263,166 @@ class GOSTSASH(lib.StreamObject):
 
         logger.info(self, 'GOSTSASH: %d surface Gaussians (cavity=%s)',
                     self.n_gaussian, self.cavity)
+        if self.n_removed_points:
+            logger.info(self, 'GOSTSASH: %d surface points with area <= %.1e Bohr^2 removed',
+                        self.n_removed_points, MIN_SURFACE_AREA)
         return self
     
     def slice_tessellation_field(self):
         if self.atom1 == self.atom2 or self.atom1 == self.atom3 or self.atom2 == self.atom3:
             raise ValueError(f"The three atom indices should be different atoms, got: [{self.atom1}, {self.atom2}, {self.atom3}]!")
         if 0 <= self.atom1 < self.mol.natm:
-            a1 = np.array(self.mol.atom_coord(self.atom1, unit = 'Bohr'))
+            self.a1 = np.array(self.mol.atom_coord(self.atom1, unit = 'Bohr'))
         else:
             raise ValueError(f"The atom index {self.atom1} does not exist in this molecule!")
         if 0 <= self.atom2 < self.mol.natm:
-            a2 = np.array(self.mol.atom_coord(self.atom2, unit = 'Bohr'))
+            self.a2 = np.array(self.mol.atom_coord(self.atom2, unit = 'Bohr'))
         else:
             raise ValueError(f"The atom index {self.atom2} does not exist in this molecule!")
         if 0 <= self.atom3 < self.mol.natm:
-            a3 = np.array(self.mol.atom_coord(self.atom3, unit = 'Bohr'))
+            self.a3 = np.array(self.mol.atom_coord(self.atom3, unit = 'Bohr'))
         else:
             raise ValueError(f"The atom index {self.atom3} does not exist in this molecule!")
-        normal_normalised, d = create_plane(a1, a2, a3)
+        o = self.create_plane()
 
         # calculate distances of the grid coordinates to the plane
-        distances = np.dot(self.surface_dict['grid_coords'], normal_normalised) - d
+        self.distances = np.dot(self.surface_dict['grid_coords'], self.n0) - o
+        self.abs_distances = np.abs(self.distances)
 
         # masking and filtering of the grid coordinates using plane width as a margin to both sides:
-        half_width = self.plane_width / 2.
-        logger.info(self, f"half_width = {half_width:.3f} Bohr")
-        slice_mask = np.abs(distances) <= half_width
-        logger.info(self, f"Tess. points in cylindrical part: {(np.count_nonzero(slice_mask) / len(distances)) * 100:.3f} percent.")
-        if np.count_nonzero(slice_mask) == len(distances):
+        self.half_width = self.plane_width / 2.
+        self.base_fraction = self.abs_distances / self.half_width
+        logger.info(self, f"half_width = {self.half_width:.3f} Bohr")
+        slice_mask = self.abs_distances <= self.half_width
+        logger.info(self, f"Tess. points in cylindrical part: {(np.count_nonzero(slice_mask) / len(self.distances)) * 100:.3f} percent.")
+        if np.count_nonzero(slice_mask) == len(self.distances):
             raise ValueError(f"It is not possible to create reasonable half-shells! \nPlease try again using a smaller width than {self.plane_width} Bohr!")
 
-        def match_average_objective(f):
-            """Solves numerically for exponent f, so that the mean of the final array list equals a predefined value"""
-            return np.mean((np.abs(distances) / half_width) ** f) - 1.0
-        
-        f_optimised = fsolve(match_average_objective, x0 = 50.0, full_output = 1)[0]
-        logger.info(self, f"f_optimised = {f_optimised}")
-        
-        self.pressure_au_list = self.pressure_au * (np.abs(distances) / half_width) ** f_optimised
+        # p_t = P * x_t^f / <x^f>_A: monotonic in the distance to the plane, area-weighted
+        # mean exactly P. Area weighting keeps the energy continuous when a surface point
+        # appears or disappears (its weight goes to zero with its area); with a plain mean
+        # the number of points would enter M and every pressure would jump.
+        area = self.surface_dict['area']
+        self.x_pow_f = self.base_fraction ** self.f_exponent
+        self.mean_x_pow_f = np.dot(area, self.x_pow_f) / np.sum(area)
+        # band points (x <= 1) only get less than P if <x^f> > 1
+        if self.mean_x_pow_f <= 1.0:
+            raise ValueError(f"The pressure inside the plane band would not be reduced (<x^f> = {self.mean_x_pow_f:.4f} <= 1)! \nPlease try again using a smaller width than {self.plane_width} Bohr!")
 
-        if not math.isclose(self.pressure_au, np.mean(self.pressure_au_list), abs_tol=0.00000000000001):
-            raise ValueError(f"The effective pressure of {self.pressure_au} a.u. can no longer be established, as the mean pressure is {np.mean(self.pressure_au_list)} a.u.! \nPlease try again using a smaller width than {self.plane_width} Bohr!")
+        self.pressure_au_list = self.pressure_au * self.x_pow_f / self.mean_x_pow_f
 
+        crossover = self.mean_x_pow_f ** (1.0 / self.f_exponent) * self.half_width
+        logger.info(self, f"f_exponent = {self.f_exponent}")
+        logger.info(self, f"<x^f> = {self.mean_x_pow_f:.6e}")
+        logger.info(self, f"p_t = P_inp at {crossover:.3f} Bohr from the plane")
+        logger.info(self, f"p_t / P_inp: min = {np.min(self.pressure_au_list) / self.pressure_au:.3e}, "
+                          f"max = {np.max(self.pressure_au_list) / self.pressure_au:.3f}")
         logger.info(self, f"P_inp = {self.pressure_au:.14f} a.u.")
-        logger.info(self, f"P_eff = {np.mean(self.pressure_au_list):.14f} a.u.")
-        
+        logger.info(self, f"P_eff = {np.dot(area, self.pressure_au_list) / np.sum(area):.14f} a.u. (area-weighted mean)")
+
+    def create_plane(self):
+        """
+        Creates a plane from 3 points in space.
+        p3
+        ^ 
+        |(v2)
+        p1 -(v1)-> p2
+        Calculates normal vector and distance d of those 3 points.
+
+        Parameters
+        ----------
+        p1, p2, p3 : np.array
+        """
+    
+        # the two connecting vectors form the plane
+        v1 = self.a2 - self.a1
+        v2 = self.a3 - self.a1 
+
+        # cross product of v1 and v2 is orthogonal to them and the normal vector of the plane
+        n = np.cross(v1, v2)
+        #print(f"normal = {normal}")
+
+        # Normalisation of the normal vector for exact euclidean distances
+        self.n_norm = np.linalg.norm(n)
+        if np.abs(self.n_norm) < 1e-5:
+            raise ValueError("The three atoms lay on a straight line, therefore they cannot form a plane!")
+        # normal_normalised directs from the origin in direction of the plane
+        self.n0 = n / self.n_norm
+ 
+        # insert point 1 into plane equation: d = n_0 · p1
+        # d is distance of plane to origin
+        o = np.dot(self.n0, self.a1)
+
+        return o
+
+    def compute_dn0_dX(self):
+        """
+        Computes the analytic derivative of the normalised plane normal vector n0 with respect to 
+        all cartesian coordinates of the 3 defining atoms.
+            dn0_dX: shape (natm, 3, 3)
+        """
+        dn0_dX = np.zeros((self.mol.natm, 3, 3))
+
+        for c in range(3):
+            ec = np.zeros(3)
+            ec[c] = 1.0
+
+            dn_dx2 = np.cross(ec, self.a3 - self.a1) #self.a3
+            dn_dx3 = np.cross(self.a2 - self.a1, ec) #self.a2
+            dn_dx1 = -dn_dx2 - dn_dx3
+
+            dn0_dX[self.atom1, c, :] = (dn_dx1 - np.dot(self.n0, dn_dx1) * self.n0) / self.n_norm
+            dn0_dX[self.atom2, c, :] = (dn_dx2 - np.dot(self.n0, dn_dx2) * self.n0) / self.n_norm
+            dn0_dX[self.atom3, c, :] = (dn_dx3 - np.dot(self.n0, dn_dx3) * self.n0) / self.n_norm
+
+        return dn0_dX
+
+
+    def compute_dpressure_dX(self, dareas):
+        """
+        Derivative of the per-point pressure p_t = P * x_t^f / M with the
+        area-weighted mean M = sum_t A_t x_t^f / sum_t A_t,
+        x_t = |d_t| / half_width, d_t = n0 . (r_t - x1), with respect to all
+        nuclear coordinates lambda = (atom, cartesian component):
+
+            dp_t/dlambda = (P / M) * [u_t - x_t^f * (dM/dlambda) / M],
+            u_t = (f / half_width) * sign(d_t) * x_t^(f-1) * dd_t/dlambda,
+            dM/dlambda = [sum_t (dA_t/dlambda x_t^f + A_t u_t) - M sum_t dA_t/dlambda] / sum_t A_t
+
+        f is a fixed input parameter, so there is no df/dlambda term.
+            dareas: dA_t/dlambda of the areas used in the energy, shape (natm, 3, ngrid)
+            returns: shape (natm, 3, ngrid)
+        """
+        mol = self.mol
+        grid = self.surface_dict['grid_coords']
+        ngrid = len(grid)
+        dn0_dX = self.compute_dn0_dX()
+
+        # dd_t/dlambda: grid points move rigidly with their atom; the plane moves with atoms 1-3
+        ddt_dlambda_all = np.zeros((mol.natm, 3, ngrid))
+        for i in range(mol.natm):
+            for c in range(3):
+                dut_dlambda_n0 = np.zeros(ngrid)
+                dut_dlambda_n0[self.atom_idx == i] = self.n0[c]
+
+                dx1_dlambda_n0 = self.n0[c] if i == self.atom1 else 0.0
+
+                dn0_dlambda_u_t_x1 = np.dot(grid - self.a1, dn0_dX[i, c, :])
+
+                ddt_dlambda_all[i, c, :] = (dut_dlambda_n0 - dx1_dlambda_n0) + dn0_dlambda_u_t_x1
+
+        f = self.f_exponent
+        # d(x_t^f)/dd_t; f >= 1, so finite also for points on the plane (sign(0) = 0)
+        dxf_ddt = (f / self.half_width) * np.sign(self.distances) * self.base_fraction ** (f - 1)
+        u = ddt_dlambda_all * dxf_ddt[np.newaxis, np.newaxis, :]   # d(x_t^f)/dlambda
+
+        M = self.mean_x_pow_f
+        area = self.surface_dict['area']
+        dM_dlambda = (np.einsum('acg,g->ac', dareas, self.x_pow_f)
+                      + np.einsum('g,acg->ac', area, u)
+                      - M * np.sum(dareas, axis=2)) / np.sum(area)
+        return (self.pressure_au / M) * (
+            u - self.x_pow_f[np.newaxis, np.newaxis, :] * (dM_dlambda / M)[:, :, np.newaxis])
 
     def dump_flags(self, verbose=None):
         logger.info(self, '******** %s ********', self.__class__)
@@ -346,6 +440,7 @@ class GOSTSASH(lib.StreamObject):
         logger.info(self, 'atom2 = %i', self.atom2)
         logger.info(self, 'atom3 = %i', self.atom3)
         logger.info(self, 'plane_width = %.4f Bohr', self.plane_width)
+        logger.info(self, 'f_exponent = %.4f', self.f_exponent)
         return self
 
     def check_sanity(self):
@@ -710,7 +805,13 @@ class GOSTSASH(lib.StreamObject):
 
         dE3 = force_operator_grad + width_grad_ftype
 
-        return dE1 + dE2 + dE3
+        # Term 4: derivative of the anisotropic pressure distribution
+        total_dP_eff = self.compute_dpressure_dX(dareas)
+
+        dE4 = np.einsum(
+                    'acg,g,g->ac', total_dP_eff, self.areas, gtilde_expval / forces, optimize=True)
+
+        return dE1 + dE2 + dE3 + dE4
 
     def _grad_direct(self, dm):
         """Integral-direct gradient: compute integrals on-the-fly in chunks."""
@@ -732,21 +833,9 @@ class GOSTSASH(lib.StreamObject):
         amplitudes = self.amplitudes
         wgrad_prefs = -np.pi * np.log(2) / (self.areas ** 2)
 
-        #print(len(dareas))
-        #print(dareas.shape)
-        #print(len(gtilde_expval))
-        #print(gtilde_expval.shape)
-        #print(len(forces))
-        #print(forces.shape)
-        #print(len(self.pressure_au_list))
-        #print(self.pressure_au_list.shape)
         # Term 1: area derivative (no chunking needed)
         dE1 = np.einsum(
             'acg,g,g->ac', dareas, self.pressure_au_list, gtilde_expval / forces, optimize=True)
-        
-        #tmp1 = np.einsum('acg,g,g->ac', dareas, self.pressure_au_list, gtilde_expval / forces, optimize=True)
-        #tmp2 = np.einsum('g,acg,g->ac', self.pressure_au_list, dareas, gtilde_expval / forces, optimize=True)
-        #np.testing.assert_array_almost_equal(tmp2, tmp1)
 
         # Chunk size: peak memory is 18 * nao^2 * C * 8 bytes
         max_memory = max(2000, mol.max_memory * 0.9 - lib.current_memory()[0])
@@ -914,7 +1003,13 @@ class GOSTSASH(lib.StreamObject):
         dE2 = gtilde_operator_grad + dE_d_total
         dE3 = force_operator_grad + width_grad_ftype
 
-        return dE1 + dE2 + dE3
+        # Term 4: derivative of the anisotropic pressure distribution
+        total_dP_eff = self.compute_dpressure_dX(dareas)
+
+        dE4 = np.einsum(
+                    'acg,g,g->ac', total_dP_eff, self.areas, gtilde_expval / forces, optimize=True)
+
+        return dE1 + dE2 + dE3 + dE4
 
     def reset(self, mol=None):
         """Reset for geometry optimization / scanner."""

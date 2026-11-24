@@ -44,6 +44,65 @@ import os
 # Pressure conversion: 1 MPa = 3.3989309735473356e-08 Hartree/Bohr^3
 MPA_TO_AU = 3.3989309735473356e-08
 
+# Surface points with a smaller (effective) area are removed from the cavity.
+# The Gaussian width pi*ln2/A of such points diverges and the width-derivative
+# terms of the analytic gradient (prefactor 1/A^2) lose precision; the error
+# was measured as ~3e-15/A Eh/Bohr (A = 3.7e-15 Bohr^2 gave an error of 4.4),
+# so this threshold bounds it to ~3e-8. gen_surface itself only drops points
+# with w*swf <= 1e-16. Removing a point of area A changes the energy by
+# roughly P*A*<G>/F, i.e. ~1e-11 Eh at 10 GPa.
+MIN_SURFACE_AREA = 1e-7  # Bohr^2
+
+# Arrays in a gen_surface dict with one entry per surface point
+_PER_POINT_KEYS = ('grid_coords', 'weights', 'charge_exp', 'switch_fun',
+                   'R_vdw', 'norm_vec', 'area')
+
+
+def remove_surface_points(surface, keep):
+    """Return a copy of a gen_surface dict with only the points where keep is True.
+
+    All per-point arrays and gslice_by_atom are updated consistently, so the
+    result can be passed to get_dF_dA.
+    """
+    out = dict(surface)
+    for key in _PER_POINT_KEYS:
+        if key in out:
+            out[key] = out[key][keep]
+    gslice, p = [], 0
+    for p0, p1 in surface['gslice_by_atom']:
+        n = int(np.count_nonzero(keep[p0:p1]))
+        gslice.append([p, p + n])
+        p += n
+    out['gslice_by_atom'] = gslice
+    return out
+
+
+def gen_pressure_surface(mol, ng, rad, r_ext=None, min_area=None):
+    """gen_surface plus removal of points with effective area <= min_area.
+
+    For the vdW/OCC cavity (r_ext given) the effective area is the area scaled
+    to the inner sphere, area * ((R - r_ext) / R)**2.
+
+    Returns
+    -------
+    surface : dict
+        Filtered gen_surface dict.
+    n_removed : int
+        Number of removed points.
+    """
+    if min_area is None:
+        min_area = MIN_SURFACE_AREA
+    surface = gen_surface(mol, ng=ng, rad=rad)
+    area = surface['area']
+    if r_ext is not None:
+        R = surface['R_vdw']
+        area = area * ((R - r_ext) / R) ** 2
+    keep = area > min_area
+    n_removed = len(keep) - int(np.count_nonzero(keep))
+    if n_removed:
+        surface = remove_surface_points(surface, keep)
+    return surface, n_removed
+
 
 def fakemol_for_gaussian(coords, exponents, l=0, cart=True, coeffs=None):
     """Build a fake Mole object representing auxiliary Gaussians.
@@ -196,7 +255,8 @@ class GOSTSHYP(lib.StreamObject):
         if self.cavity == 'vdw/occ':
             r_ext = self.r_ext
             rad_outer = rad + r_ext
-            self.surface_dict = gen_surface(mol, ng=self.npoints, rad=rad_outer)
+            self.surface_dict, self.n_removed_points = gen_pressure_surface(
+                mol, self.npoints, rad_outer, r_ext=r_ext)
 
             # Save outer surface_dict for gradient computation
             self._outer_surface_dict = dict(self.surface_dict)
@@ -216,7 +276,8 @@ class GOSTSHYP(lib.StreamObject):
             self.surface_dict['area'] = area_occ
             self.surface_dict['R_vdw'] = R_inner
         else:
-            self.surface_dict = gen_surface(mol, ng=self.npoints, rad=rad)
+            self.surface_dict, self.n_removed_points = gen_pressure_surface(
+                mol, self.npoints, rad)
             self._outer_surface_dict = None
             self._occ_ratio_sq = None
 
@@ -247,6 +308,9 @@ class GOSTSHYP(lib.StreamObject):
 
         logger.info(self, 'GOSTSHYP: %d surface Gaussians (cavity=%s)',
                     self.n_gaussian, self.cavity)
+        if self.n_removed_points:
+            logger.info(self, 'GOSTSHYP: %d surface points with area <= %.1e Bohr^2 removed',
+                        self.n_removed_points, MIN_SURFACE_AREA)
         return self
 
     def dump_flags(self, verbose=None):

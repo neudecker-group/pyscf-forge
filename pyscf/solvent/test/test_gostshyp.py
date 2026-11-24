@@ -301,5 +301,58 @@ class TestReset(unittest.TestCase):
         self.assertTrue(mf.converged)
 
 
+class TestSmallAreaPoints(unittest.TestCase):
+    """Surface points with tiny area made the analytic gradient wrong.
+
+    In this randomly distorted cyclopentadiene (sigma = 0.1 Angstrom, numpy seed 7)
+    the vdW/OCC surface has a point of area 3.7e-15 Bohr^2 on atom 10 (Gaussian
+    width ~6e14). Before such points were removed (MIN_SURFACE_AREA), the analytic
+    gradient of atom 10 was wrong by up to 4.4 Eh/Bohr. The error grows like
+    ~3e-15/A, so symmetric test molecules (smallest area >= 1e-9) never showed it.
+    """
+    # Bohr
+    CP_DISTORTED = [
+        ['C', [0.000232465294, 2.280662373296, -0.694311429053]],
+        ['C', [-0.168297466402, -2.310127974695, -0.829900922483]],
+        ['C', [0.011365493705, 1.636543499388, 1.664431744167]],
+        ['C', [-0.117252762783, -1.290712791267, 1.824887166129]],
+        ['C', [0.019920406023, -0.175832977216, -2.273199142788]],
+        ['H', [0.131393261106, 3.903377739341, -1.371490610569]],
+        ['H', [-0.359279028002, -4.401084789592, -1.633051246248]],
+        ['H', [-0.044425785205, 2.368309379153, 3.452768558770]],
+        ['H', [0.029621662345, -2.643146880855, 2.925908366738]],
+        ['H', [1.561160785777, -0.009165350359, -3.493478296591]],
+        ['H', [-1.952112742638, -0.090282284682, -3.699803898210]]]
+
+    @staticmethod
+    def energy(atom):
+        mol = gto.M(atom=atom, unit='Bohr', basis='sto-3g', verbose=0)
+        mf = gostshyp_for_scf(scf.RHF(mol), GOSTSHYP(
+            mol, options={'npoints': 110, 'pressure_mpa': 10_000}))
+        mf.conv_tol = 1e-12
+        e = mf.kernel()
+        assert mf.converged
+        return mf, e
+
+    def test_small_points_removed(self):
+        from pyscf.solvent.gostshyp import MIN_SURFACE_AREA
+        mol = gto.M(atom=self.CP_DISTORTED, unit='Bohr', basis='sto-3g', verbose=0)
+        gost = GOSTSHYP(mol, options={'npoints': 110, 'pressure_mpa': 10_000})
+        self.assertGreater(gost.n_removed_points, 0)
+        self.assertGreater(gost.areas.min(), MIN_SURFACE_AREA)
+        self.assertEqual(gost.surface_dict['gslice_by_atom'][-1][1], gost.n_gaussian)
+        self.assertEqual(len(gost._outer_surface_dict['area']), gost.n_gaussian)
+
+    def test_gradient_atom10(self):
+        mf, _ = self.energy(self.CP_DISTORTED)
+        ana = mf.Gradients().kernel()
+        h = 1e-4
+        for c in range(3):
+            ap = [[s, list(x)] for s, x in self.CP_DISTORTED]; ap[10][1][c] += h
+            am = [[s, list(x)] for s, x in self.CP_DISTORTED]; am[10][1][c] -= h
+            num = (self.energy(ap)[1] - self.energy(am)[1]) / (2 * h)
+            self.assertAlmostEqual(ana[10, c], num, delta=1e-7)
+
+
 if __name__ == '__main__':
     unittest.main()
