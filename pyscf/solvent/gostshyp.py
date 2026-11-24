@@ -140,6 +140,8 @@ class GOSTSHYP(lib.StreamObject):
         Number of Lebedev grid points per atom (default: 110).
     scaling_factor : float
         Van der Waals radii scaling factor (default: 1.2).
+    proberad : float
+        Probe radius in Bohr added to the scaled vdW radii (default: 0.0).
     cavity : str
         Cavity type: 'vdw' or 'vdw/occ' (default: 'vdw/occ').
     r_ext : float
@@ -159,6 +161,7 @@ class GOSTSHYP(lib.StreamObject):
         self.pressure_mpa = options.get('pressure_mpa', 50_000)
         self.npoints = options.get('npoints', 110)
         self.scaling_factor = options.get('scaling_factor', 1.2)
+        self.proberad = options.get('proberad', 0.0)  # Bohr
         self.cavity = options.get('cavity', 'vdw/occ')
         self.r_ext = options.get('r_ext', 0.4724)  # Bohr (0.25 Ang)
         self.direct = options.get('direct', True)
@@ -191,7 +194,7 @@ class GOSTSHYP(lib.StreamObject):
             self.mol = mol
         mol = self.mol
 
-        rad = self.scaling_factor * modified_Bondi
+        rad = self.scaling_factor * modified_Bondi + self.proberad
 
         if self.cavity == 'vdw/occ':
             r_ext = self.r_ext
@@ -255,6 +258,7 @@ class GOSTSHYP(lib.StreamObject):
                     self.pressure_mpa, self.pressure_au)
         logger.info(self, 'npoints = %d', self.npoints)
         logger.info(self, 'scaling_factor = %.2f', self.scaling_factor)
+        logger.info(self, 'proberad = %.4f Bohr', self.proberad)
         logger.info(self, 'cavity = %s', self.cavity)
         if self.cavity == 'vdw/occ':
             logger.info(self, 'r_ext = %.4f Bohr', self.r_ext)
@@ -267,6 +271,8 @@ class GOSTSHYP(lib.StreamObject):
             raise ValueError(f'pressure_mpa must be positive, got {self.pressure_mpa}')
         if self.scaling_factor <= 0:
             raise ValueError(f'scaling_factor must be positive, got {self.scaling_factor}')
+        if self.proberad < 0:
+            raise ValueError(f'proberad must be >= 0, got {self.proberad}')
         if self.cavity not in ('vdw', 'vdw/occ'):
             raise ValueError(f"cavity must be 'vdw' or 'vdw/occ', got '{self.cavity}'")
         if self.cavity == 'vdw/occ' and self.r_ext <= 0:
