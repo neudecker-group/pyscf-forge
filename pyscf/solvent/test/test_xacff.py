@@ -145,6 +145,20 @@ class TestXACFFHessian(unittest.TestCase):
         """CH2 midpoint as anchor point, ring C=C midpoint as third point."""
         self.check(CP_DISTORTED, ([9, 10], 4, [2, 3]), 4)
 
+    def check_scaling(self, atom, atom_list, scal, rescale):
+        opts = options(atom_list, 4, scaling_factor=scal, rescale_forces=rescale)
+        jac_ana = xacff_external_terms(make_mol(atom), symmetrize=False, **opts)[1]
+        jac_fd = fd_jacobian(atom, opts)
+        np.testing.assert_allclose(jac_ana, jac_fd, rtol=0, atol=1e-6 * np.abs(jac_ana).max())
+
+    def test_hessian_scaling_factors(self):
+        """Scaling factors 1.0 and 1.8, with and without 1/s^2 force rescaling.
+        2026-11-25: rel. error 5.5e-11 to 2.7e-9 for 1.0 / 1.2 / 1.5 / 1.8."""
+        for scal in (1.0, 1.8):
+            for rescale in (True, False):
+                self.check_scaling(NH3_DISTORTED, (0, 1, 2), scal, rescale)
+        self.check_scaling(CP_DISTORTED, ([9, 10], 4, [2, 3]), 1.8, True)
+
     def test_single_atom_groups_unchanged(self):
         mol = make_mol(CP_DISTORTED)
         g0, h0 = xacff_external_terms(mol, symmetrize=False, **options([2, 5, 6], 4))

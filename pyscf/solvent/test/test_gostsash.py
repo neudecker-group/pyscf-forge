@@ -167,9 +167,9 @@ class TestGOSTSASHGradient(unittest.TestCase):
         assert mf.converged
         return mf, e
 
-    def check_gradient(self, direct, atom=NH3, atom_list=(0, 1, 2), f=4):
+    def check_gradient(self, direct, atom=NH3, atom_list=(0, 1, 2), f=4, **kw):
         mol = make_mol(atom)
-        opts = make_options(list(atom_list), f, direct=direct)
+        opts = make_options(list(atom_list), f, direct=direct, **kw)
         mf, _ = self.energy(mol, opts)
         ana = mf.Gradients().kernel()
         h = 1e-4
@@ -202,6 +202,25 @@ class TestGOSTSASHGradient(unittest.TestCase):
     def test_gradient_overlapping_plane_groups_cached(self):
         """Atom 2 belongs to two groups; atom 0 is a single point."""
         self.check_gradient(direct=False, atom=NH3_DISTORTED, atom_list=([1, 2], [2, 3], 0), f=4)
+
+    # Cavity type and scaling factor. The plain 'vdw' cavity uses a different code path
+    # for the area derivatives (no outer surface). 2026-11-25, h = 1e-4: max |ana - num|
+    # 2.4-3.3e-9 Eh/Bohr for vdw and vdw/occ with scaling 1.0, 1.2, 1.5, 1.8.
+    def test_gradient_vdw_scaling_1_0(self):
+        self.check_gradient(direct=True, atom=NH3_DISTORTED, atom_list=(0, 1, 2), f=4,
+                            cavity='vdw', scaling_factor=1.0)
+
+    def test_gradient_vdw_scaling_1_8_groups(self):
+        self.check_gradient(direct=False, atom=NH3_DISTORTED, atom_list=([1, 2], 0, 3), f=4,
+                            cavity='vdw', scaling_factor=1.8)
+
+    def test_gradient_occ_scaling_1_0_groups(self):
+        self.check_gradient(direct=True, atom=NH3_DISTORTED, atom_list=([1, 2], 0, 3), f=4,
+                            cavity='vdw/occ', scaling_factor=1.0)
+
+    def test_gradient_occ_scaling_1_8(self):
+        self.check_gradient(direct=False, atom=NH3_DISTORTED, atom_list=(0, 1, 2), f=4,
+                            cavity='vdw/occ', scaling_factor=1.8)
 
 
 class TestGOSTSASHOrientation(unittest.TestCase):
