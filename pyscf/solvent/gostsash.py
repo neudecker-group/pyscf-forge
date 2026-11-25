@@ -213,8 +213,9 @@ class GOSTSASH(lib.StreamObject):
         if self.cavity == 'vdw/occ':
             r_ext = self.r_ext
             rad_outer = rad + r_ext
+            # GOSTSASH always removes tiny-area points (GOSTSHYP: optional 'min_area')
             self.surface_dict, self.n_removed_points = gen_pressure_surface(
-                mol, self.npoints, rad_outer, r_ext=r_ext)
+                mol, self.npoints, rad_outer, r_ext=r_ext, min_area=MIN_SURFACE_AREA)
 
             # Save outer surface_dict for gradient computation
             self._outer_surface_dict = dict(self.surface_dict)
@@ -235,7 +236,7 @@ class GOSTSASH(lib.StreamObject):
             self.surface_dict['R_vdw'] = R_inner
         else:
             self.surface_dict, self.n_removed_points = gen_pressure_surface(
-                mol, self.npoints, rad)
+                mol, self.npoints, rad, min_area=MIN_SURFACE_AREA)
             self._outer_surface_dict = None
             self._occ_ratio_sq = None
         

@@ -306,10 +306,13 @@ class TestSmallAreaPoints(unittest.TestCase):
 
     In this randomly distorted cyclopentadiene (sigma = 0.1 Angstrom, numpy seed 7)
     the vdW/OCC surface has a point of area 3.7e-15 Bohr^2 on atom 10 (Gaussian
-    width ~6e14). Before such points were removed (MIN_SURFACE_AREA), the analytic
-    gradient of atom 10 was wrong by up to 4.4 Eh/Bohr. The error grows like
-    ~3e-15/A, so symmetric test molecules (smallest area >= 1e-9) never showed it.
+    width ~6e14). Without removing such points, the analytic gradient of atoms 4
+    and 10 is wrong by 4 to 32 Eh/Bohr (random numerical noise, ~3e-15/A to
+    1e-13/A), so symmetric test molecules (smallest area >= 1e-9) never showed it.
+    Removal is optional
+    in GOSTSHYP ('min_area', default None = plain gen_surface as in the theory).
     """
+    OPTS = {'npoints': 110, 'pressure_mpa': 10_000, 'min_area': 1e-7}
     # Bohr
     CP_DISTORTED = [
         ['C', [0.000232465294, 2.280662373296, -0.694311429053]],
@@ -327,19 +330,31 @@ class TestSmallAreaPoints(unittest.TestCase):
     @staticmethod
     def energy(atom):
         mol = gto.M(atom=atom, unit='Bohr', basis='sto-3g', verbose=0)
-        mf = gostshyp_for_scf(scf.RHF(mol), GOSTSHYP(
-            mol, options={'npoints': 110, 'pressure_mpa': 10_000}))
+        mf = gostshyp_for_scf(scf.RHF(mol), GOSTSHYP(mol, options=dict(TestSmallAreaPoints.OPTS)))
         mf.conv_tol = 1e-12
         e = mf.kernel()
         assert mf.converged
         return mf, e
 
-    def test_small_points_removed(self):
-        from pyscf.solvent.gostshyp import MIN_SURFACE_AREA
+    def test_no_filtering_by_default(self):
+        """Default: plain gen_surface, the 3.7e-15 Bohr^2 point is kept."""
         mol = gto.M(atom=self.CP_DISTORTED, unit='Bohr', basis='sto-3g', verbose=0)
         gost = GOSTSHYP(mol, options={'npoints': 110, 'pressure_mpa': 10_000})
+        self.assertIsNone(gost.min_area)
+        self.assertEqual(gost.n_removed_points, 0)
+        self.assertLess(gost.areas.min(), 1e-14)
+
+    def test_min_area_validation(self):
+        mol = gto.M(atom=self.CP_DISTORTED, unit='Bohr', basis='sto-3g', verbose=0)
+        for bad in (-1e-7, '1e-7', True):
+            with self.assertRaises(ValueError):
+                GOSTSHYP(mol, options={'npoints': 110, 'min_area': bad})
+
+    def test_small_points_removed(self):
+        mol = gto.M(atom=self.CP_DISTORTED, unit='Bohr', basis='sto-3g', verbose=0)
+        gost = GOSTSHYP(mol, options=dict(self.OPTS))
         self.assertGreater(gost.n_removed_points, 0)
-        self.assertGreater(gost.areas.min(), MIN_SURFACE_AREA)
+        self.assertGreater(gost.areas.min(), self.OPTS['min_area'])
         self.assertEqual(gost.surface_dict['gslice_by_atom'][-1][1], gost.n_gaussian)
         self.assertEqual(len(gost._outer_surface_dict['area']), gost.n_gaussian)
 

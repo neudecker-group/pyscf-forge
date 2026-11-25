@@ -44,13 +44,17 @@ import os
 # Pressure conversion: 1 MPa = 3.3989309735473356e-08 Hartree/Bohr^3
 MPA_TO_AU = 3.3989309735473356e-08
 
-# Surface points with a smaller (effective) area are removed from the cavity.
+# Recommended threshold for removing surface points with a tiny (effective) area.
 # The Gaussian width pi*ln2/A of such points diverges and the width-derivative
-# terms of the analytic gradient (prefactor 1/A^2) lose precision; the error
-# was measured as ~3e-15/A Eh/Bohr (A = 3.7e-15 Bohr^2 gave an error of 4.4),
-# so this threshold bounds it to ~3e-8. gen_surface itself only drops points
-# with w*swf <= 1e-16. Removing a point of area A changes the energy by
-# roughly P*A*<G>/F, i.e. ~1e-11 Eh at 10 GPa.
+# terms of the analytic gradient (prefactor 1/A^2) lose precision. The resulting
+# error is numerical noise of random sign and size, roughly 3e-15/A to 1e-13/A
+# Eh/Bohr (A = 3.7e-15 Bohr^2: 4 to 32 Eh/Bohr depending on 1e-12 Bohr changes
+# of the geometry), so this threshold bounds it to ~1e-6 Eh/Bohr. In GOSTSASH it
+# is additionally scaled by the local pressure p_t/P (up to ~20 at the poles).
+# gen_surface itself only drops points with w*swf <= 1e-16. Removing a point of
+# area A changes the energy by roughly p*A*<G>/F, i.e. ~1e-11 Eh at 10 GPa.
+# GOSTSHYP: optional (option 'min_area', default None = no extra filtering, as in
+# the theory and other implementations). GOSTSASH: always applied.
 MIN_SURFACE_AREA = 1e-7  # Bohr^2
 
 # Arrays in a gen_surface dict with one entry per surface point
@@ -78,21 +82,22 @@ def remove_surface_points(surface, keep):
 
 
 def gen_pressure_surface(mol, ng, rad, r_ext=None, min_area=None):
-    """gen_surface plus removal of points with effective area <= min_area.
+    """gen_surface plus optional removal of points with effective area <= min_area.
 
+    min_area=None returns the plain gen_surface result (no extra filtering).
     For the vdW/OCC cavity (r_ext given) the effective area is the area scaled
     to the inner sphere, area * ((R - r_ext) / R)**2.
 
     Returns
     -------
     surface : dict
-        Filtered gen_surface dict.
+        (Filtered) gen_surface dict.
     n_removed : int
         Number of removed points.
     """
-    if min_area is None:
-        min_area = MIN_SURFACE_AREA
     surface = gen_surface(mol, ng=ng, rad=rad)
+    if min_area is None:
+        return surface, 0
     area = surface['area']
     if r_ext is not None:
         R = surface['R_vdw']
@@ -205,6 +210,16 @@ class GOSTSHYP(lib.StreamObject):
         Extension radius for vdW/OCC in Bohr (default: 0.4724 ~ 0.25 Ang).
     direct : bool
         If True, compute integrals on-the-fly without caching (default: True).
+    min_area : float or None
+        Remove surface points with an effective area <= min_area (Bohr^2) after
+        gen_surface (default: None, no extra filtering, consistent with the
+        GOSTSHYP theory and other implementations). Points with a tiny area make
+        the analytic gradient inaccurate: numerical noise of roughly 3e-15/A to
+        1e-13/A Eh/Bohr (e.g. 4 to 32 Eh/Bohr for A = 3.7e-15 Bohr^2), which
+        occurs mostly for distorted geometries. MIN_SURFACE_AREA = 1e-7 is the
+        recommended value (error <= ~1e-6 Eh/Bohr, energy change ~1e-11 Eh); set
+        it also when comparing with GOSTSASH, which always uses it, so that both
+        models are built on the same surface.
     """
 
     def __init__(self, mol, options=None):
@@ -221,6 +236,13 @@ class GOSTSHYP(lib.StreamObject):
         self.cavity = options.get('cavity', 'vdw/occ')
         self.r_ext = options.get('r_ext', 0.4724)  # Bohr (0.25 Ang)
         self.direct = options.get('direct', True)
+        self.min_area = options.get('min_area', None)
+        if self.min_area is not None:
+            if isinstance(self.min_area, bool) or not isinstance(self.min_area, (int, float)):
+                raise ValueError(f"min_area must be None or a number (Bohr^2), got '{self.min_area}'")
+            if self.min_area < 0:
+                raise ValueError(f'min_area must not be negative, got {self.min_area}')
+            self.min_area = float(self.min_area)
         self.write_grid = options.get('write_grid', False)
         self.output = options.get('output', " ")
         self.opt_counter = 0
@@ -256,7 +278,7 @@ class GOSTSHYP(lib.StreamObject):
             r_ext = self.r_ext
             rad_outer = rad + r_ext
             self.surface_dict, self.n_removed_points = gen_pressure_surface(
-                mol, self.npoints, rad_outer, r_ext=r_ext)
+                mol, self.npoints, rad_outer, r_ext=r_ext, min_area=self.min_area)
 
             # Save outer surface_dict for gradient computation
             self._outer_surface_dict = dict(self.surface_dict)
@@ -277,7 +299,7 @@ class GOSTSHYP(lib.StreamObject):
             self.surface_dict['R_vdw'] = R_inner
         else:
             self.surface_dict, self.n_removed_points = gen_pressure_surface(
-                mol, self.npoints, rad)
+                mol, self.npoints, rad, min_area=self.min_area)
             self._outer_surface_dict = None
             self._occ_ratio_sq = None
 
@@ -310,7 +332,7 @@ class GOSTSHYP(lib.StreamObject):
                     self.n_gaussian, self.cavity)
         if self.n_removed_points:
             logger.info(self, 'GOSTSHYP: %d surface points with area <= %.1e Bohr^2 removed',
-                        self.n_removed_points, MIN_SURFACE_AREA)
+                        self.n_removed_points, self.min_area)
         return self
 
     def dump_flags(self, verbose=None):
@@ -323,6 +345,8 @@ class GOSTSHYP(lib.StreamObject):
         if self.cavity == 'vdw/occ':
             logger.info(self, 'r_ext = %.4f Bohr', self.r_ext)
         logger.info(self, 'direct = %s', self.direct)
+        logger.info(self, 'min_area = %s', 'None (no extra filtering)' if self.min_area is None
+                    else f'{self.min_area:.1e} Bohr^2')
         logger.info(self, 'n_gaussian = %d', self.n_gaussian)
         return self
 

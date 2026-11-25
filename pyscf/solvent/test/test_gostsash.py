@@ -55,9 +55,9 @@ NH3_DISTORTED = [
     ['H', [-1.647930923680, -0.795604546631, -0.442784183349]]]
 
 # Bohr; CP randomly distorted (sigma = 0.1 Angstrom, numpy seed 7). Its vdW/OCC
-# surface contains a point of area 3.7e-15 Bohr^2 on atom 10, which made the
-# analytic gradient of atom 10 wrong by up to 4.4 Eh/Bohr before such points
-# were removed (MIN_SURFACE_AREA).
+# surface contains a point of area 3.7e-15 Bohr^2 on atom 10. Without removing
+# such points (MIN_SURFACE_AREA), the analytic gradient of atoms 4 and 10 is wrong
+# by random numerical noise (GOSTSHYP 4-32 Eh/Bohr; GOSTSASH scaled by p_t/P).
 CP_DISTORTED = [
     ['C', [0.000232465294, 2.280662373296, -0.694311429053]],
     ['C', [-0.168297466402, -2.310127974695, -0.829900922483]],
@@ -211,7 +211,8 @@ class TestGOSTSASHOrientation(unittest.TestCase):
             mf.conv_tol = 1e-10
             energies.append(mf.kernel())
             self.assertTrue(mf.converged)
-        # 2026-11-24, area-weighted mean: difference 2.2e-4 Eh (~0.58 kJ/mol)
+        # 2026-11-24, area-weighted mean: difference 2.2e-4 Eh (~0.58 kJ/mol) at 110 points;
+        # the sign flips with more points (-5.7 kJ/mol at 1202, -6.3 kJ/mol at 2702)
         self.assertGreater(abs(energies[0] - energies[1]), 1e-4)
 
 
@@ -231,7 +232,7 @@ class TestSmallAreaPoints(unittest.TestCase):
         """Removing near-zero-area points must leave the other pressures unchanged.
         With the plain mean, the number of points entered <x^f> and every p_t jumped."""
         mol = make_mol(CP_DISTORTED)
-        with mock.patch('pyscf.solvent.gostshyp.MIN_SURFACE_AREA', 0.0):
+        with mock.patch('pyscf.solvent.gostsash.MIN_SURFACE_AREA', 0.0):
             g_all = GOSTSASH(mol, dict(self.OPTS))
         g = GOSTSASH(mol, dict(self.OPTS))
         kept = g_all.areas > MIN_SURFACE_AREA
@@ -240,7 +241,10 @@ class TestSmallAreaPoints(unittest.TestCase):
                                    rtol=1e-8, atol=0)
 
     def test_gradient_atom10(self):
-        """Atom 10 carried the 3.7e-15 Bohr^2 point; its gradient was off by ~0.5."""
+        """Atom 10 carries the 3.7e-15 Bohr^2 point. Without removing it, the analytic
+        gradient is off by up to ~14 Eh/Bohr, scaled by the local p_t/P (plane [0,8,9]);
+        with the plain mean, finite differences were also off by ~0.5 because the
+        number of points entered M."""
         mol = make_mol(CP_DISTORTED)
         mf, _ = TestGOSTSASHGradient.energy(mol, self.OPTS)
         ana = mf.Gradients().kernel()
