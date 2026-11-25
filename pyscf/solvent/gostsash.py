@@ -119,6 +119,49 @@ def compute_surface_normals(atom_coords, grid, atom_idx):
             'surface tessellation is degenerate.')
     return dr / dr_norm
 
+
+def _is_index(x):
+    return isinstance(x, (int, np.integer)) and not isinstance(x, (bool, np.bool_))
+
+
+def parse_plane_groups(atom_list, natm):
+    """Validate atom_list and return the three plane points as tuples of atom indices.
+
+    Each of the three entries is an atom index or a list/tuple of atom indices;
+    the plane point is then the mean position of these atoms, e.g.
+    atom_list = [[9, 10], 4, 2] uses the midpoint of atoms 9 and 10.
+    """
+    if atom_list is None:
+        raise ValueError("You have not specified a list of three atoms (or atom groups) to construct a plane from!")
+    if not isinstance(atom_list, (list, tuple)) or len(atom_list) != 3:
+        raise ValueError(f"atom_list must be a list of exactly 3 entries (atom index or list of "
+                         f"atom indices), got '{atom_list}'")
+    groups = []
+    for entry in atom_list:
+        group = [entry] if _is_index(entry) else entry
+        if not isinstance(group, (list, tuple)) or len(group) == 0 or not all(_is_index(i) for i in group):
+            raise ValueError(f"Each entry of atom_list must be an atom index or a non-empty list of "
+                             f"atom indices of type int, got '{entry}' in '{atom_list}'")
+        if len(set(group)) != len(group):
+            raise ValueError(f"An atom group must not contain the same atom twice, got '{entry}'")
+        for i in group:
+            if not 0 <= i < natm:
+                raise ValueError(f"The atom index {i} does not exist in this molecule!")
+        groups.append(tuple(int(i) for i in group))
+    if len({frozenset(g) for g in groups}) != 3:
+        raise ValueError(f"The three plane points must be built from different atoms (groups), got: {atom_list}!")
+    return tuple(groups)
+
+
+def plane_point_weights(groups, natm):
+    """Weights W (3, natm) with plane points a_k = W[k] @ atom_coords: W[k, B] = 1/|group_k|
+    if atom B belongs to group k. Also d a_k / d X_B = W[k, B] * identity."""
+    W = np.zeros((3, natm))
+    for k, g in enumerate(groups):
+        W[k, list(g)] = 1.0 / len(g)
+    return W
+
+
 class GOSTSASH(lib.StreamObject):
     """
     GOSTSASH pressure solvation model.
@@ -139,6 +182,11 @@ class GOSTSASH(lib.StreamObject):
         Extension radius for vdW/OCC in Bohr (default: 0.4724 ~ 0.25 Ang).
     direct : bool
         If True, compute integrals on-the-fly without caching (default: True).
+    atom_list : list
+        Three points defining the plane (required). Each entry is an atom index
+        or a list of atom indices whose mean position is used, e.g.
+        [[9, 10], 4, 2] for the midpoint of atoms 9 and 10 (useful for molecules
+        without a symmetric CH2 bridge, or ring centres).
     f_exponent : float
         Exponent f of the anisotropic pressure distribution (required, no default).
         Each surface point t gets p_t = P * |d_t|**f / M, where d_t is the distance
@@ -166,10 +214,9 @@ class GOSTSASH(lib.StreamObject):
         self.write_grid = options.get('write_grid', False)
         self.output = options.get('output', " ")
         self.atom_list = options.get('atom_list', None)
-        if self.atom_list is not None:
-            self.atom1 = self.atom_list[0]
-            self.atom2 = self.atom_list[1]
-            self.atom3 = self.atom_list[2]
+        # plane points: atom index or mean position of a group of atoms
+        self.plane_groups = parse_plane_groups(self.atom_list, mol.natm)
+        self.plane_weights = plane_point_weights(self.plane_groups, mol.natm)
         if 'plane_width' in options:
             raise ValueError("The option 'plane_width' was removed: it cancels out of the normalised "
                              "pressure distribution p_t = P |d_t|^f / <|d|^f>_A. Only f_exponent "
@@ -274,20 +321,8 @@ class GOSTSASH(lib.StreamObject):
         return self
     
     def slice_tessellation_field(self):
-        if self.atom1 == self.atom2 or self.atom1 == self.atom3 or self.atom2 == self.atom3:
-            raise ValueError(f"The three atom indices should be different atoms, got: [{self.atom1}, {self.atom2}, {self.atom3}]!")
-        if 0 <= self.atom1 < self.mol.natm:
-            self.a1 = np.array(self.mol.atom_coord(self.atom1, unit = 'Bohr'))
-        else:
-            raise ValueError(f"The atom index {self.atom1} does not exist in this molecule!")
-        if 0 <= self.atom2 < self.mol.natm:
-            self.a2 = np.array(self.mol.atom_coord(self.atom2, unit = 'Bohr'))
-        else:
-            raise ValueError(f"The atom index {self.atom2} does not exist in this molecule!")
-        if 0 <= self.atom3 < self.mol.natm:
-            self.a3 = np.array(self.mol.atom_coord(self.atom3, unit = 'Bohr'))
-        else:
-            raise ValueError(f"The atom index {self.atom3} does not exist in this molecule!")
+        # plane points (Bohr): single atoms or mean positions of atom groups
+        self.a1, self.a2, self.a3 = self.plane_weights @ self.mol.atom_coords()
         o = self.create_plane()
 
         # calculate distances of the grid coordinates to the plane
@@ -354,25 +389,24 @@ class GOSTSASH(lib.StreamObject):
 
     def compute_dn0_dX(self):
         """
-        Computes the analytic derivative of the normalised plane normal vector n0 with respect to 
-        all cartesian coordinates of the 3 defining atoms.
+        Computes the analytic derivative of the normalised plane normal vector n0 with respect to
+        all cartesian coordinates. The plane points a_k are atoms or mean positions of atom
+        groups, a_k = sum_B W[k, B] X_B, so dn0/dX_B = sum_k W[k, B] dn0/da_k.
             dn0_dX: shape (natm, 3, 3)
         """
-        dn0_dX = np.zeros((self.mol.natm, 3, 3))
-
+        dn0_da = np.zeros((3, 3, 3))   # [plane point k, cartesian c, component of n0]
         for c in range(3):
             ec = np.zeros(3)
             ec[c] = 1.0
 
-            dn_dx2 = np.cross(ec, self.a3 - self.a1) #self.a3
-            dn_dx3 = np.cross(self.a2 - self.a1, ec) #self.a2
-            dn_dx1 = -dn_dx2 - dn_dx3
+            dn_da2 = np.cross(ec, self.a3 - self.a1)
+            dn_da3 = np.cross(self.a2 - self.a1, ec)
+            dn_da1 = -dn_da2 - dn_da3
 
-            dn0_dX[self.atom1, c, :] = (dn_dx1 - np.dot(self.n0, dn_dx1) * self.n0) / self.n_norm
-            dn0_dX[self.atom2, c, :] = (dn_dx2 - np.dot(self.n0, dn_dx2) * self.n0) / self.n_norm
-            dn0_dX[self.atom3, c, :] = (dn_dx3 - np.dot(self.n0, dn_dx3) * self.n0) / self.n_norm
+            for k, dn in enumerate((dn_da1, dn_da2, dn_da3)):
+                dn0_da[k, c] = (dn - np.dot(self.n0, dn) * self.n0) / self.n_norm
 
-        return dn0_dX
+        return np.einsum('kB,kcn->Bcn', self.plane_weights, dn0_da)
 
 
     def compute_dpressure_dX(self, dareas):
@@ -395,14 +429,15 @@ class GOSTSASH(lib.StreamObject):
         ngrid = len(grid)
         dn0_dX = self.compute_dn0_dX()
 
-        # dd_t/dlambda: grid points move rigidly with their atom; the plane moves with atoms 1-3
+        # dd_t/dlambda: grid points move rigidly with their atom; the plane moves with the
+        # atoms of its three points (anchor x1 = a1 with weights W[0, i] = 1/|group 1|)
         ddt_dlambda_all = np.zeros((mol.natm, 3, ngrid))
         for i in range(mol.natm):
             for c in range(3):
                 dut_dlambda_n0 = np.zeros(ngrid)
                 dut_dlambda_n0[self.atom_idx == i] = self.n0[c]
 
-                dx1_dlambda_n0 = self.n0[c] if i == self.atom1 else 0.0
+                dx1_dlambda_n0 = self.plane_weights[0, i] * self.n0[c]
 
                 dn0_dlambda_u_t_x1 = np.dot(grid - self.a1, dn0_dX[i, c, :])
 
@@ -433,9 +468,9 @@ class GOSTSASH(lib.StreamObject):
         logger.info(self, 'direct = %s', self.direct)
         logger.info(self, 'n_gaussian = %d', self.n_gaussian)
         logger.info(self, f'atom_list = {self.atom_list}')
-        logger.info(self, 'atom1 = %i', self.atom1)
-        logger.info(self, 'atom2 = %i', self.atom2)
-        logger.info(self, 'atom3 = %i', self.atom3)
+        for k, g in enumerate(self.plane_groups, 1):
+            logger.info(self, 'plane point %d = %s', k,
+                        f'atom {g[0]}' if len(g) == 1 else f'mean of atoms {list(g)}')
         logger.info(self, 'f_exponent = %.4f', self.f_exponent)
         return self
 
@@ -452,12 +487,7 @@ class GOSTSASH(lib.StreamObject):
             raise ValueError(f'If grid and amplitudes should be written to file, you have to give a file path for the output')
         if self.write_grid == True and not os.path.isdir(self.output):
             raise ValueError(f"The output file path '{self.output}' you have given does not exist!")
-        if not isinstance(self.atom_list, list):
-            raise ValueError(f"atom_list must be a list of 3 atom indices, got '{self.atom_list}'")
-        if len(self.atom_list) != 3:
-            raise ValueError(f"atom_list must be a list of exactly 3 atom indices, got '{self.atom_list}'")
-        if not isinstance(self.atom1, int) or not isinstance(self.atom2, int) or not isinstance(self.atom3, int):
-            raise ValueError(f"atom_list must be a list of exactly 3 atom indices of type int, got '[{self.atom1}, {self.atom2}, {self.atom3}]'")
+        # atom_list is validated in __init__ (parse_plane_groups)
 
         return self
 

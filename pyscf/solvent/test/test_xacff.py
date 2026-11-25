@@ -137,6 +137,21 @@ class TestXACFFHessian(unittest.TestCase):
     def test_hessian_cp(self):
         self.check(CP_DISTORTED, (2, 5, 6), 4)
 
+    def test_hessian_plane_groups_nh3(self):
+        """Averaged and overlapping plane points (atom 2 in two groups)."""
+        self.check(NH3_DISTORTED, ([1, 2], [2, 3], 0), 4)
+
+    def test_hessian_plane_groups_cp(self):
+        """CH2 midpoint as anchor point, ring C=C midpoint as third point."""
+        self.check(CP_DISTORTED, ([9, 10], 4, [2, 3]), 4)
+
+    def test_single_atom_groups_unchanged(self):
+        mol = make_mol(CP_DISTORTED)
+        g0, h0 = xacff_external_terms(mol, symmetrize=False, **options([2, 5, 6], 4))
+        g1, h1 = xacff_external_terms(mol, symmetrize=False, **options([[2], [5], (6,)], 4))
+        np.testing.assert_array_equal(g0, g1)
+        np.testing.assert_array_equal(h0, h1)
+
 
 if __name__ == '__main__':
     unittest.main()

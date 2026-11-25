@@ -15,6 +15,7 @@ from pyscf.grad import rhf as rhf_grad
 from pyscf.hessian import rhf as rhf_hess
 from pyscf.solvent.pcm import gen_surface, modified_Bondi
 from pyscf.solvent.grad.pcm import get_dF_dA
+from pyscf.solvent.gostsash import parse_plane_groups, plane_point_weights
 
 # 1 MPa in Eh/Bohr^3
 MPA_TO_AU = 3.3989309735473356e-08
@@ -82,47 +83,49 @@ def check_f_exponent(f_exponent):
     return float(f_exponent)
 
 
-def dnormal_dX(natm, atom_list, p1, p2, p3):
+def dnormal_dX(weights, p1, p2, p3):
     """Derivative of the unit plane normal n0 with respect to all nuclear coordinates.
 
-    Only the three plane atoms contribute. Returns shape (natm, 3, 3): [atom, cartesian, n0 component].
+    The plane points are atoms or mean positions of atom groups, p_k = sum_B W[k, B] X_B
+    (weights from plane_point_weights), so dn0/dX_B = sum_k W[k, B] dn0/dp_k.
+    Returns shape (natm, 3, 3): [atom, cartesian, n0 component].
     """
     n = np.cross(p2 - p1, p3 - p1)
     n_norm = np.linalg.norm(n)
     n0 = n / n_norm
-    dn0 = np.zeros((natm, 3, 3))
+    dn0_dp = np.zeros((3, 3, 3))   # [plane point k, cartesian c, n0 component]
     for c in range(3):
         ec = np.zeros(3)
         ec[c] = 1.0
-        dn_dx2 = np.cross(ec, p3 - p1)
-        dn_dx3 = np.cross(p2 - p1, ec)
-        dn_dx1 = -dn_dx2 - dn_dx3
-        for ia, dn in zip(atom_list, (dn_dx1, dn_dx2, dn_dx3)):
-            dn0[ia, c] = (dn - np.dot(n0, dn) * n0) / n_norm
-    return dn0
+        dn_dp2 = np.cross(ec, p3 - p1)
+        dn_dp3 = np.cross(p2 - p1, ec)
+        dn_dp1 = -dn_dp2 - dn_dp3
+        for k, dn in enumerate((dn_dp1, dn_dp2, dn_dp3)):
+            dn0_dp[k, c] = (dn - np.dot(n0, dn) * n0) / n_norm
+    return np.einsum('kB,kcn->Bcn', weights, dn0_dp)
 
 
 def dpressure_dX(p_eff, d_pow_f, mean_d_pow_f, distances, f_exponent, area, dareas,
-                 grid, atom_idx, atom_list, p1, p2, p3, normal):
+                 grid, atom_idx, weights, p1, p2, p3, normal):
     """Derivative of p_t = P * |d_t|^f / M, M = sum(A |d|^f) / sum(A), with respect to all
     nuclear coordinates lambda (same as GOSTSASH Term 4):
 
         dp_t/dlambda = (P / M) * [u_t - |d_t|^f * (dM/dlambda) / M],
         u_t = f * sign(d_t) * |d_t|^(f-1) * dd_t/dlambda,
-        dd_t/dlambda = delta(B, A(t)) n0_c - delta(B, atom1) n0_c + dn0/dlambda . (r_t - x1),
+        dd_t/dlambda = delta(B, A(t)) n0_c - W[0, B] n0_c + dn0/dlambda . (r_t - x1),
         dM/dlambda = [sum_t (dA_t |d_t|^f + A_t u_t) - M sum_t dA_t] / sum_t A_t
 
-    p_eff: input pressure P (after force rescaling), dareas: shape (natm, 3, ngrid).
-    Returns shape (natm, 3, ngrid).
+    p_eff: input pressure P (after force rescaling), dareas: shape (natm, 3, ngrid),
+    weights: plane point weights W (3, natm). Returns shape (natm, 3, ngrid).
     """
     natm = dareas.shape[0]
-    dn0 = dnormal_dX(natm, atom_list, p1, p2, p3)
+    dn0 = dnormal_dX(weights, p1, p2, p3)
     # dd_t/dlambda, (natm, 3, ngrid): grid points move rigidly with their atom,
-    # the plane moves with its three atoms
+    # the plane moves with the atoms of its three points (anchor p1: weights W[0])
     ddt = np.einsum('acn,gn->acg', dn0, grid - p1)
     for ia in range(natm):
         ddt[ia][:, atom_idx == ia] += normal[:, None]
-    ddt[atom_list[0]] -= normal[:, None]
+    ddt -= weights[0][:, None, None] * normal[None, :, None]
 
     u = ddt * (f_exponent * np.sign(distances) * np.abs(distances) ** (f_exponent - 1))
     M = mean_d_pow_f
@@ -142,7 +145,8 @@ def xacff_external_terms(mol, pressure_mpa=50_000.0, npoints=302, scaling_factor
         npoints: Lebedev points per atom
         scaling_factor: vdW cavity scaling factor
         rescale_forces: Apply 1/s^2 force rescaling if True
-        atom_list: three atom indices defining the plane
+        atom_list: three points defining the plane; each entry is an atom index or
+            a list of atom indices whose mean position is used, e.g. [[9, 10], 4, 2]
         plane_width: removed (raises ValueError); it cancels out of p_t
         f_exponent: exponent f of the anisotropic pressure distribution
             (required, no default, >= 1). Each surface point t gets
@@ -163,37 +167,12 @@ def xacff_external_terms(mol, pressure_mpa=50_000.0, npoints=302, scaling_factor
                          "pressure distribution p_t = P |d_t|^f / <|d|^f>_A. Only f_exponent "
                          "controls the anisotropy.")
 
-    if atom_list is None:
-        raise ValueError(f"You have not specified a list of three atoms to construct a plane from!")
-    if not isinstance(atom_list, list):
-        raise ValueError(f"atom_list must be a list of 3 atom indices, got '{atom_list}'")
-    if len(atom_list) != 3:
-        raise ValueError(f"atom_list must be a list of exactly 3 atom indices, got '{atom_list}'")
-    if not isinstance(atom_list[0], int) or not isinstance(atom_list[1], int) or not isinstance(atom_list[2], int):
-        raise ValueError(f"atom_list must be a list of exactly 3 atom indices of type int, got '[{atom_list[0]}, {atom_list[1]}, {atom_list[2]}]'")
-
-    atom1 = atom_list[0]
-    atom2 = atom_list[1]
-    atom3 = atom_list[2]
-
-    if atom1 == atom2 or atom1 == atom3 or atom2 == atom3:
-        raise ValueError(f"The three atom indices should be different atoms, got: [{atom1}, {atom2}, {atom3}]!")
-    if 0 <= atom1 < mol.natm:
-        a1 = np.array(mol.atom_coord(atom1, unit = 'Bohr'))
-    else:
-        raise ValueError(f"The atom index {atom1} does not exist in this molecule!")
-    if 0 <= atom2 < mol.natm:
-        a2 = np.array(mol.atom_coord(atom2, unit = 'Bohr'))
-    else:
-        raise ValueError(f"The atom index {atom2} does not exist in this molecule!")
-    if 0 <= atom3 < mol.natm:
-        a3 = np.array(mol.atom_coord(atom3, unit = 'Bohr'))
-    else:
-        raise ValueError(f"The atom index {atom3} does not exist in this molecule!")
-    normal_normalised, d = create_plane(a1, a2, a3)
-
+    # plane points: atom index or mean position of a group of atoms
     natm = mol.natm
     coords = mol.atom_coords()
+    weights = plane_point_weights(parse_plane_groups(atom_list, natm), natm)
+    a1, a2, a3 = weights @ coords
+    normal_normalised, d = create_plane(a1, a2, a3)
 
     surf, atom_idx = build_surface(mol, npoints=npoints, scaling_factor=scaling_factor)
     area = surf['area']
@@ -235,7 +214,7 @@ def xacff_external_terms(mol, pressure_mpa=50_000.0, npoints=302, scaling_factor
     _, dA = get_dF_dA(surf)                       # (ngrid, natm, 3)
     dareas = dA.transpose(1, 2, 0)                # (natm, 3, ngrid)
     dp = dpressure_dX(p_eff, d_pow_f, mean_d_pow_f, distances, f_exponent, area, dareas,
-                      grid, atom_idx, atom_list, a1, a2, a3, normal_normalised)
+                      grid, atom_idx, weights, a1, a2, a3, normal_normalised)
     dq_scalar = p_eff_list * dareas + area * dp   # (natm, 3, ngrid): d(p_t A_t)/dX_jb
     h_ext = np.zeros((natm, natm, 3, 3))
 

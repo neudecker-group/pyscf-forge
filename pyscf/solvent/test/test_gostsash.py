@@ -195,6 +195,14 @@ class TestGOSTSASHGradient(unittest.TestCase):
         # plane without the N atom; 2026-11-24: max |ana - num| = 2.9e-9 Eh/Bohr
         self.check_gradient(direct=False, atom=NH3_DISTORTED, atom_list=(1, 2, 3), f=8)
 
+    def test_gradient_plane_group_direct(self):
+        """First plane point = midpoint of H1 and H2 (also enters the anchor term)."""
+        self.check_gradient(direct=True, atom=NH3_DISTORTED, atom_list=([1, 2], 0, 3), f=4)
+
+    def test_gradient_overlapping_plane_groups_cached(self):
+        """Atom 2 belongs to two groups; atom 0 is a single point."""
+        self.check_gradient(direct=False, atom=NH3_DISTORTED, atom_list=([1, 2], [2, 3], 0), f=4)
+
 
 class TestGOSTSASHOrientation(unittest.TestCase):
     """The plane orientation must change the energy (was test_orient.py).
@@ -254,6 +262,58 @@ class TestSmallAreaPoints(unittest.TestCase):
             ep = TestGOSTSASHGradient.energy(displaced(mol, 10, c, h), self.OPTS)[1]
             em = TestGOSTSASHGradient.energy(displaced(mol, 10, c, -h), self.OPTS)[1]
             self.assertAlmostEqual(ana[10, c], (ep - em) / (2 * h), delta=1e-7)
+
+
+class TestPlaneGroups(unittest.TestCase):
+    """Plane points as mean positions of atom groups, e.g. atom_list=[[9, 10], 4, 2]."""
+
+    def test_single_atom_groups_unchanged(self):
+        mol = make_mol(CP_DISTORTED)
+        g_old = GOSTSASH(mol, make_options([2, 5, 6], 4))
+        g_new = GOSTSASH(mol, make_options([[2], (5,), [6]], 4))
+        np.testing.assert_array_equal(g_old.pressure_au_list, g_new.pressure_au_list)
+        np.testing.assert_array_equal(g_old.compute_dpressure_dX(area_derivatives(g_old)),
+                                      g_new.compute_dpressure_dX(area_derivatives(g_new)))
+
+    def test_plane_point_is_mean_position(self):
+        mol = make_mol(CP_DISTORTED)
+        g = GOSTSASH(mol, make_options([[9, 10], 4, [2, 3]], 4))
+        X = mol.atom_coords()
+        np.testing.assert_allclose(g.a1, 0.5 * (X[9] + X[10]), rtol=0, atol=1e-14)
+        np.testing.assert_allclose(g.a2, X[4], rtol=0, atol=1e-14)
+        np.testing.assert_allclose(g.a3, 0.5 * (X[2] + X[3]), rtol=0, atol=1e-14)
+        self.assertEqual(g.plane_groups, ((9, 10), (4,), (2, 3)))
+
+    def test_invalid_atom_lists(self):
+        mol = make_mol(NH3)
+        for bad in ([[], 1, 2],            # empty group
+                    [[1, 1], 0, 2],        # atom twice in a group
+                    [[1, 2], [2, 1], 0],   # identical plane points
+                    [0, 1, 1],             # identical single atoms
+                    [[0, 7], 1, 2],        # index out of range
+                    [[0, 1.0], 1, 2],      # not an integer
+                    [0, 1],                # only two points
+                    None):
+            with self.assertRaises(ValueError, msg=str(bad)):
+                GOSTSASH(mol, make_options(bad, 4))
+
+    def test_dpressure_dX_finite_difference_groups(self):
+        """dp_t/dX with averaged and overlapping plane points against finite differences."""
+        h = 1e-5
+        for atom, al in ((NH3_DISTORTED, [[1, 2], 0, 3]),
+                         (NH3_DISTORTED, [[1, 2], [2, 3], 0]),
+                         (CP_DISTORTED, [[9, 10], 4, [2, 3]])):
+            mol = make_mol(atom)
+            g = GOSTSASH(mol, make_options(al, 4))
+            ana = g.compute_dpressure_dX(area_derivatives(g))
+            for i in range(mol.natm):
+                for c in range(3):
+                    gp = GOSTSASH(displaced(mol, i, c, h), make_options(al, 4))
+                    gm = GOSTSASH(displaced(mol, i, c, -h), make_options(al, 4))
+                    self.assertEqual(gp.n_gaussian, gm.n_gaussian)
+                    num = (gp.pressure_au_list - gm.pressure_au_list) / (2 * h)
+                    np.testing.assert_allclose(ana[i, c], num, rtol=0,
+                                               atol=1e-6 * np.abs(ana).max())
 
 
 if __name__ == '__main__':
