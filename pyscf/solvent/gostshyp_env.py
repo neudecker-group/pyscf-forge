@@ -13,11 +13,11 @@
 # limitations under the License.
 
 """
-GOSTSHYP pressure solvation model.
+GOSTSHYPEnv: GOSTSHYP pressure model with pressure redistributed 
+according to a sampled solvent environment.
 
-The GOSTSHYP (Gaussian On Surface Tesserae Simulate HYdrostatic Pressure)
-model applies an isotropic pressure to a molecular cavity surface using
-Gaussian-weighted integrals.
+GOSTSHYP with the pressure on each cavity tessera weighted by a frozen
+Gaussian field derived from a sampled solvent environment.
 
 Supports two cavity types:
   - 'vdw': van der Waals surface with scaled Bondi radii
@@ -30,7 +30,6 @@ References:
     J. Chem. Theory Comput. 2025, 21, 2, 764-776
     https://doi.org/10.1021/acs.jctc.4c01502
 """
-
 import numpy as np
 from functools import cached_property
 
@@ -39,6 +38,7 @@ from pyscf.lib import logger
 from pyscf.solvent import _attach_solvent
 from pyscf.solvent.pcm import gen_surface, modified_Bondi
 from pyscf.solvent.grad.pcm import get_dF_dA
+from scipy.spatial import cKDTree
 import os
 
 # Pressure conversion: 1 MPa = 3.3989309735473356e-08 Hartree/Bohr^3
@@ -126,6 +126,112 @@ def compute_surface_normals(atom_coords, grid, atom_idx):
     return dr / dr_norm
 
 
+def _build_field_trees(field, n_bins=8):
+    """Sort the field Gaussians into width classes and build one KD-tree per class.
+
+    Parameters
+    ----------
+    field : dict
+        Solvent field with 'r' (n, 3) centers in Bohr, 'w' (n,) exponents, 'p' (n,) weights.
+    n_bins : int
+        Number of width classes (quantiles of w).
+
+    Returns
+    -------
+    trees : list of (ndarray, cKDTree, float)
+        Per class: field indices, KD-tree over their centers, smallest exponent in the class.
+    """
+    fw = field['w']
+    edges = np.quantile(fw, np.linspace(0, 1, n_bins + 1))
+    cls = np.clip(np.searchsorted(edges, fw, side='right') - 1, 0, n_bins - 1)
+    trees = []
+    for c in range(n_bins):
+        idx = np.nonzero(cls == c)[0]
+        if len(idx):
+            trees.append((idx, cKDTree(field['r'][idx]), fw[idx].min()))
+    return trees
+
+
+def _field_b_screened(grid_coords, widths, atom_idx, field, trees, deriv=False, eps=1e-20, block_size=16):
+    """Field overlap b_j = N_j sum_i p_i <G_j|G_i> and optionally its derivatives, with spatial screening.
+
+    Pairs with a_ji d^2 > -ln(eps) + 5, a_ji = w_j w_i / (w_j + w_i), are skipped. Candidates are found
+    with one KD-tree query per block of neighbouring tesserae and width class of the field.
+
+    Parameters
+    ----------
+    grid_coords : ndarray of shape (ngrids, 3)
+        Tessera centers in Bohr.
+    widths : ndarray of shape (ngrids,)
+        Tessera Gaussian exponents.
+    atom_idx : ndarray of shape (ngrids,)
+        Atom index of each tessera.
+    field : dict
+        Solvent field with 'r', 'w', 'p'.
+    trees : list
+        Output of _build_field_trees(field).
+    deriv : bool
+        Also return db/dr (eq 17) and db/dw (eq 23).
+    eps : float
+        Screening threshold (relative contribution of a skipped pair).
+    block_size : int
+        Number of tesserae per KD-tree query.
+
+    Returns
+    -------
+    b : ndarray of shape (ngrids,)
+    db_dr : ndarray of shape (ngrids, 3), only if deriv
+    db_dw : ndarray of shape (ngrids,), only if deriv
+    """
+    fr, fw, fp = field['r'], field['w'], field['p']
+    cut = -np.log(eps) + 5.0
+
+    n_grid = len(widths)
+    b = np.zeros(n_grid)
+    if deriv:
+        db_dr = np.zeros((n_grid, 3))
+        db_dw = np.zeros(n_grid)
+    for atm in np.unique(atom_idx):
+        idx_atm = np.nonzero(atom_idx == atm)[0]
+        for blk in np.array_split(idx_atm, max(1, len(idx_atm) // block_size)):
+            r_b, w_b = grid_coords[blk], widths[blk]
+            center = r_b.mean(axis=0)
+            radius = np.sqrt(((r_b - center) ** 2).sum(axis=1).max())
+            wb_min = w_b.min()
+            sel = []
+            for idx_c, tree_c, wf_min in trees:
+                mu = wb_min * wf_min / (wb_min + wf_min)
+                hits = tree_c.query_ball_point(center, radius + np.sqrt(cut / mu))
+                if len(hits):
+                    sel.append(idx_c[hits])
+            if not sel:
+                continue
+            sel = np.concatenate(sel)
+            rf, wf, pf = fr[sel], fw[sel], fp[sel]
+
+            diff = r_b[:, None, :] - rf[None, :, :]
+            d2 = np.einsum('jic,jic->ji', diff, diff)
+            inv = 1.0 / (w_b[:, None] + wf[None, :])
+            a = w_b[:, None] * wf[None, :] * inv
+            ad2 = a * d2
+            jj, ii = np.nonzero(ad2 < cut)
+
+            x = np.pi * inv[jj, ii]
+            pve = pf[ii] * x * np.sqrt(x) * np.exp(-ad2[jj, ii])
+            N = (w_b / np.pi) ** 1.5
+            nb = len(blk)
+            b[blk] = N * np.bincount(jj, pve, nb)
+            if deriv:
+                wa = pve * a[jj, ii]
+                db_dr[blk] = -2 * N[:, None] * np.stack(
+                    [np.bincount(jj, wa * diff[jj, ii, c], nb) for c in range(3)], axis=1)
+                r_ = wf[ii] * inv[jj, ii]
+                db_dw[blk] = N * np.bincount(jj, pve * (1.5 / w_b[jj] - 1.5 * inv[jj, ii] - r_ * r_ * d2[jj, ii]), nb)
+    if deriv:
+        return b, db_dr, db_dw
+    return b
+    
+
 class GOSTSHYPEnv(lib.StreamObject):
     """
     GOSTSHYP pressure solvation model.
@@ -146,6 +252,14 @@ class GOSTSHYPEnv(lib.StreamObject):
         Extension radius for vdW/OCC in Bohr (default: 0.4724 ~ 0.25 Ang).
     direct : bool
         If True, compute integrals on-the-fly without caching (default: True).
+    solvent_field : dict, optional
+        Frozen field {'r' (Bohr), 'w', 'p'} representing the sampled solvent environment
+        (crest2gost.build_field), in the aligned frame of the ensemble.
+        None gives standard GOSTSHYP.
+    area_min : float
+        Tesserae with area <= area_min (Bohr^2) are dropped after tessellation
+        (default: 0.0). A small positive value (e.g. 1e-5) removes tiny seam
+        tesserae whose huge exponents break the gradient integrals.
     """
 
     def __init__(self, mol, options=None):
@@ -165,6 +279,7 @@ class GOSTSHYPEnv(lib.StreamObject):
         self.write_grid = options.get('write_grid', False)
         self.output = options.get('output', " ")
         self.solvent_field = options.get('solvent_field', None)
+        self.area_min = options.get('area_min', 0.0)  # Bohr^2
 
         self.opt_counter = 0
         self.scf_counter = 0
@@ -176,10 +291,6 @@ class GOSTSHYPEnv(lib.StreamObject):
         self.amplitudes = None
         self.pressure_au_list = None
 
-        # Accumulated wall-clock time for kernel() and grad()
-        self._t_wall = 0.0
-        self._grad_t_wall = 0.0
-
         self.build()
 
     @property
@@ -189,7 +300,6 @@ class GOSTSHYPEnv(lib.StreamObject):
 
     def build(self, mol=None):
         """Build surface tessellation."""
-        #print("Building surface")
         if mol is not None:
             self.mol = mol
         mol = self.mol
@@ -197,9 +307,20 @@ class GOSTSHYPEnv(lib.StreamObject):
         rad = self.scaling_factor * modified_Bondi
 
         if self.cavity == 'vdw/occ':
+            rad = rad + self.r_ext
+        self.surface_dict = gen_surface(mol, ng=self.npoints, rad=rad)
+
+        # drop tiny seam tesserae: their huge exponents (w = pi ln2 / A) break the integrals
+        keep = self.surface_dict['area'] > self.area_min
+        self.n_dropped = int((~keep).sum())
+        if not keep.all():
+            n = [int(keep[p0:p1].sum()) for p0, p1 in self.surface_dict['gslice_by_atom']]
+            self.surface_dict['gslice_by_atom'] = [[e - c, e] for c, e in zip(n, np.cumsum(n))]
+            for k in ('grid_coords', 'weights', 'charge_exp', 'switch_fun', 'R_vdw', 'norm_vec', 'area'):
+                self.surface_dict[k] = self.surface_dict[k][keep]
+
+        if self.cavity == 'vdw/occ':
             r_ext = self.r_ext
-            rad_outer = rad + r_ext
-            self.surface_dict = gen_surface(mol, ng=self.npoints, rad=rad_outer)
 
             # Save outer surface_dict for gradient computation
             self._outer_surface_dict = dict(self.surface_dict)
@@ -219,10 +340,8 @@ class GOSTSHYPEnv(lib.StreamObject):
             self.surface_dict['area'] = area_occ
             self.surface_dict['R_vdw'] = R_inner
         else:
-            self.surface_dict = gen_surface(mol, ng=self.npoints, rad=rad)
             self._outer_surface_dict = None
             self._occ_ratio_sq = None
-
         # Build atom index
         atom_idx = np.zeros(len(self.surface_dict['area']), dtype=np.int32)
         for i, (start, stop) in enumerate(self.surface_dict['gslice_by_atom']):
@@ -257,13 +376,18 @@ class GOSTSHYPEnv(lib.StreamObject):
         self.pressure_au_list = np.full(self.n_gaussian, self.pressure_au)
 
         if self.solvent_field is not None:
-            self._b = np.empty(len(self.areas))
-            for k, (r_k, w_k) in enumerate(zip(self.grid_coords, self.widths)):
-                d2 = ((self.solvent_field['r'] - r_k) ** 2).sum(axis=1)
-                wsum = w_k + self.solvent_field['w']
-                V = (np.pi / wsum) ** 1.5
-                E = np.exp(-w_k * self.solvent_field['w'] / wsum * d2)
-                self._b[k] = (w_k / np.pi) ** 1.5 * np.dot(self.solvent_field['p'], V * E)
+            if getattr(self, '_field_tree_src', None) is not self.solvent_field['r']:
+                self._field_trees = _build_field_trees(self.solvent_field)
+                self._field_tree_src = self.solvent_field['r']
+            if getattr(self, 'field_grad', False):
+                self._b, db_dr, db_dw = _field_b_screened(
+                    self.grid_coords, self.widths, self.atom_idx, self.solvent_field, self._field_trees, deriv=True)
+                self._field_deriv = (self.grid_coords.copy(), self.widths.copy(), db_dr, db_dw)
+            else:
+                
+                self._b = _field_b_screened(
+                    self.grid_coords, self.widths, self.atom_idx, self.solvent_field, self._field_trees)
+                self._field_deriv = None
 
             self._b_mean = np.dot(self.areas, self._b) / self.areas.sum()
             self._g = self._b / self._b_mean
@@ -291,6 +415,7 @@ class GOSTSHYPEnv(lib.StreamObject):
             logger.info(self, 'r_ext = %.4f Bohr', self.r_ext)
         logger.info(self, 'direct = %s', self.direct)
         logger.info(self, 'n_gaussian = %d', self.n_gaussian)
+        logger.info(self, 'area_min = %.1e Bohr^2 (%d tesserae dropped)', self.area_min, self.n_dropped)
         return self
 
     def check_sanity(self):
@@ -327,11 +452,6 @@ class GOSTSHYPEnv(lib.StreamObject):
         energy : float
         fock : ndarray of shape (nao, nao)
         """
-        #print("Starting SCF cycle")
-        import time as _time
-        _t0 = _time.perf_counter()
-
-        #print("Starting SCF cycle")
         if not (isinstance(dm, np.ndarray) and dm.ndim == 2):
             dm = dm[0] + dm[1]
 
@@ -340,7 +460,6 @@ class GOSTSHYPEnv(lib.StreamObject):
         else:
             result = self._kernel_cached(dm)
 
-        self._t_wall += _time.perf_counter() - _t0
         return result
 
     def _kernel_cached(self, dm):
@@ -508,11 +627,6 @@ class GOSTSHYPEnv(lib.StreamObject):
         """
         print("Calculating gradient")
         self.opt_counter += 1
-        import time as _time
-        _t0 = _time.perf_counter()
-
-        print("Calculating gradient")
-        self.opt_counter += 1
         if self.forces is None:
             raise RuntimeError(
                 'kernel() must be called before grad(). '
@@ -526,7 +640,6 @@ class GOSTSHYPEnv(lib.StreamObject):
         else:
             result = self._grad_cached(dm)
 
-        self._grad_t_wall = _time.perf_counter() - _t0
         return result
 
     def _grad_cached(self, dm):
@@ -666,51 +779,26 @@ class GOSTSHYPEnv(lib.StreamObject):
         # Term 4: P_eff derivative
         if self.solvent_field is not None:
             natm = mol.natm
- 
-            db_dr = np.empty((self.n_gaussian, 3))  # (ngrid, 3)
-            #print(f"\ndb_dr (before loop): {db_dr.shape}\n")
-            db_dw = np.empty(self.n_gaussian)       # (ngrid,)
-            #print(f"\ndb_dw (before loop): {db_dw.shape}\n")
 
-            for k, (r_k, w_k) in enumerate(zip(self.grid_coords, self.widths)):
-                d2 = ((self.solvent_field['r'] - r_k) ** 2).sum(axis=1)    # (nfield,)
-                #print(f"\nd2: {d2.shape}\n")
-                wsum = w_k + self.solvent_field['w']                       # (nfield,)
-                #print(f"\nwsum: {wsum.shape}\n")
-                V = (np.pi / wsum) ** 1.5                                  # (nfield,)
-                #print(f"\nV: {V.shape}\n")
-                E = np.exp(-w_k * self.solvent_field['w'] / wsum * d2)     # (nfield,)
-                #print(f"\nE: {E.shape}\n")
-                N = (w_k / np.pi) ** 1.5                                   # ()
-                #print(f"\nN: {N.shape}\n")
-                a = w_k * self.solvent_field['w'] / wsum                   # (nfield,)
-                #print(f"\na: {a.shape}\n")
-
-                db_dr[k] = -2 * N * np.einsum('i,ic->c', self.solvent_field['p'] * V * a * E, r_k - self.solvent_field['r'])     # eq 17
-
-                bracket = 1.5 / w_k - 1.5 / wsum - (self.solvent_field['w'] / wsum) ** 2 * d2
-                db_dw[k] = N * np.dot(self.solvent_field['p'], V * E * bracket)         # eq 23
-
-            #print(f"\ndb_dr (after loop): {db_dr.shape}\n")
-            #print(f"\ndb_dw (after loop): {db_dw.shape}\n")
+            cache = getattr(self, '_field_deriv', None)
+            if (cache is not None and np.array_equal(cache[0], self.grid_coords)
+                    and np.array_equal(cache[1], self.widths)):
+                db_dr, db_dw = cache[2], cache[3]
+            else:
+                self.field_grad = True
+                _, db_dr, db_dw = _field_b_screened(
+                    self.grid_coords, self.widths, self.atom_idx, self.solvent_field, self._field_trees, deriv=True)
 
             db = np.zeros((natm, 3, self.n_gaussian))   # (natm, 3, ngrids)
-            #print(f"\ndb (after init): {db.shape}\n")
             db[self.atom_idx, :, np.arange(self.n_gaussian)] = db_dr    # (natm, 3, ngrids); eq 25 (first part)
             db-= (self.widths / self.areas * db_dw)[None, None, :] * dareas    # (natm, 3, ngrids); eq 25 (second part)
-            #print(f"\ndb (filled): {db.shape}\n")
 
             dAb_sum = np.einsum('acg,g->ac' ,dareas, self._b) + np.einsum('g,acg->ac', self.areas, db)  # (natm, 3); part of eq. 26
-            #print(f"\ndAb_sum: {dAb_sum.shape}\n")
             dA_sum = dareas.sum(axis=2)                                                             # (natm, 3)
-            #print(f"\ndA_sum: {dA_sum.shape}\n")
             dbbar = (dAb_sum - self._b_mean * dA_sum) / self.areas.sum()                            # (natm, 3); eq 26
-            #print(f"\ndbbar: {dbbar.shape}\n")
 
             dg = (db - self._g[None, None, :] * dbbar[:, :, None]) / self._b_mean                   # (natm, 3, ngrids); eq 15
-            #print(f"\ndg: {dg.shape}\n")
             dE4 = self.pressure_au * np.einsum('acg,g,g->ac' , dg, self.areas, gtilde_expval / forces, optimize=True)  # (natm, 3); eq 14
-            #print(f"\ndE4: {dE4.shape}\n")
         else:
             dE4 = 0.0
 
@@ -911,32 +999,24 @@ class GOSTSHYPEnv(lib.StreamObject):
         if self.solvent_field is not None:
             natm = mol.natm
  
-            db_dr = np.empty((self.n_gaussian, 3))  # (ngrid, 3)
-            db_dw = np.empty(self.n_gaussian)       # (ngrid,)
-
-            for k, (r_k, w_k) in enumerate(zip(self.grid_coords, self.widths)):
-                d2 = ((self.solvent_field['r'] - r_k) ** 2).sum(axis=1)    # (nfield,)
-                wsum = w_k + self.solvent_field['w']                       # (nfield,)
-                V = (np.pi / wsum) ** 1.5                                  # (nfield,)
-                E = np.exp(-w_k * self.solvent_field['w'] / wsum * d2)     # (nfield,)
-                N = (w_k / np.pi) ** 1.5                                   # ()
-                a = w_k * self.solvent_field['w'] / wsum                   # (nfield,)
-
-                db_dr[k] = -2 * N * np.einsum('i,ic->c', self.solvent_field['p'] * V * a * E, r_k - self.solvent_field['r'])     # eq 17
-
-                bracket = 1.5 / w_k - 1.5 / wsum - (self.solvent_field['w'] / wsum) ** 2 * d2
-                db_dw[k] = N * np.dot(self.solvent_field['p'], V * E * bracket)         # eq 23
-
+            cache = getattr(self, '_field_deriv', None)
+            if (cache is not None and np.array_equal(cache[0], self.grid_coords)
+                    and np.array_equal(cache[1], self.widths)):
+                db_dr, db_dw = cache[2], cache[3]
+            else:
+                self.field_grad = True
+                _, db_dr, db_dw = _field_b_screened(
+                    self.grid_coords, self.widths, self.atom_idx, self.solvent_field, self._field_trees, deriv=True)
             db = np.zeros((natm, 3, self.n_gaussian))   # (natm, 3, ngrids)
             db[self.atom_idx, :, np.arange(self.n_gaussian)] = db_dr    # (natm, 3, ngrids); eq 25 (first part)
-            db-= (self.widths / self.areas * db_dw)[None, None, :] * dareas    # (natm, 3, ngrids); eq 25 (second part)
+            db -= (self.widths / self.areas * db_dw)[None, None, :] * dareas    # (natm, 3, ngrids); eq 25 (second part)
 
-            dAb_sum = np.einsum('acg,g->ac' ,dareas, self._b) + np.einsum('g,acg->ac', self.areas, db)  # (natm, 3); part of eq. 26
+            dAb_sum = np.einsum('acg,g->ac', dareas, self._b) + np.einsum('g,acg->ac', self.areas, db)  # (natm, 3); part of eq. 26
             dA_sum = dareas.sum(axis=2)                                                             # (natm, 3)
             dbbar = (dAb_sum - self._b_mean * dA_sum) / self.areas.sum()                            # (natm, 3); eq 26
 
             dg = (db - self._g[None, None, :] * dbbar[:, :, None]) / self._b_mean                   # (natm, 3, ngrids); eq 15
-            dE4 = self.pressure_au * np.einsum('acg,g,g->ac' , dg, self.areas, gtilde_expval / forces, optimize=True)  # (natm, 3); eq 14
+            dE4 = self.pressure_au * np.einsum('acg,g,g->ac', dg, self.areas, gtilde_expval / forces, optimize=True)  # (natm, 3); eq 14
         else:
             dE4 = 0.0
 
@@ -953,8 +1033,6 @@ class GOSTSHYPEnv(lib.StreamObject):
         self.v = None
         self.amplitudes = None
         self.forces = None
-        self._t_wall = 0.0
-        self._grad_t_wall = 0.0
         self.build()
         self.scf_counter = 0
 
